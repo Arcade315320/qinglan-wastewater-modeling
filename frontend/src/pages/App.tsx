@@ -1,0 +1,658 @@
+import {
+  Activity,
+  ArrowRight,
+  BarChart3,
+  Building2,
+  CalendarDays,
+  CheckCircle2,
+  ChevronDown,
+  CircleHelp,
+  ClipboardCheck,
+  Database,
+  Droplets,
+  FileDown,
+  FileSpreadsheet,
+  FileText,
+  FlaskConical,
+  Gauge,
+  Home,
+  MapPin,
+  Menu,
+  Play,
+  Plus,
+  Save,
+  Settings2,
+  SlidersHorizontal,
+  Target,
+  Upload,
+  X
+} from "lucide-react";
+import { useEffect, useMemo, useState } from "react";
+
+type PageId = "home" | "project" | "input" | "result" | "report";
+
+const pages: { id: PageId; label: string; icon: typeof Home }[] = [
+  { id: "home", label: "工作台", icon: Home },
+  { id: "project", label: "项目概览", icon: Activity },
+  { id: "input", label: "数据录入", icon: Settings2 },
+  { id: "result", label: "仿真结果", icon: BarChart3 },
+  { id: "report", label: "报告导出", icon: FileText }
+];
+
+const initialIndicators = [
+  { name: "流量", key: "flow", value: "5000", unit: "m³/d" },
+  { name: "COD", key: "cod", value: "260", unit: "mg/L" },
+  { name: "BOD₅", key: "bod", value: "120", unit: "mg/L" },
+  { name: "NH₄-N", key: "nh4", value: "32", unit: "mg/L" },
+  { name: "TN", key: "tn", value: "48", unit: "mg/L" },
+  { name: "TP", key: "tp", value: "4.2", unit: "mg/L" },
+  { name: "TSS", key: "tss", value: "180", unit: "mg/L" },
+  { name: "pH", key: "ph", value: "7.1", unit: "-" },
+  { name: "水温", key: "temperature", value: "22", unit: "°C" }
+];
+
+const resultRows = [
+  { name: "COD", inlet: 260, outlet: 36.4, limit: 50, unit: "mg/L", pass: true },
+  { name: "NH₄-N", inlet: 32, outlet: 3.84, limit: 5, unit: "mg/L", pass: true },
+  { name: "TN", inlet: 48, outlet: 15.36, limit: 15, unit: "mg/L", pass: false },
+  { name: "TP", inlet: 4.2, outlet: 1.18, limit: 0.5, unit: "mg/L", pass: false },
+  { name: "TSS", inlet: 180, outlet: 18, limit: 10, unit: "mg/L", pass: false }
+];
+
+type ProjectApiRecord = {
+  id: string;
+  name: string;
+  plant_name: string;
+  process_type: string;
+  owner: string | null;
+  description: string | null;
+  created_at: string;
+  storage_mode?: "api" | "local";
+};
+
+const apiBaseUrl = (import.meta.env.VITE_API_BASE_URL as string | undefined)?.replace(/\/$/, "") ?? "";
+const isStaticDeployment = window.location.hostname.endsWith("github.io");
+
+type ProcessDefinition = {
+  id: string;
+  label: string;
+  shortLabel: string;
+  category: string;
+  description: string;
+  steps: string[];
+  features: string[];
+};
+
+const processCatalog: ProcessDefinition[] = [
+  {
+    id: "CAS",
+    label: "传统活性污泥法（CAS）",
+    shortLabel: "CAS",
+    category: "活性污泥法",
+    description: "以曝气池和二沉池为核心，主要去除有机物，作为其他活性污泥工艺的基础形式。",
+    steps: ["进水", "预处理", "初沉池", "曝气池", "二沉池", "消毒", "出水"],
+    features: ["二沉池污泥回流至曝气池", "剩余污泥由二沉池排出"]
+  },
+  {
+    id: "AO",
+    label: "缺氧-好氧工艺（A/O）",
+    shortLabel: "A/O",
+    category: "脱氮除磷工艺",
+    description: "前置缺氧段利用进水碳源反硝化，后续好氧段完成有机物降解和硝化。",
+    steps: ["进水", "预处理", "缺氧池", "好氧池", "二沉池", "消毒", "出水"],
+    features: ["好氧末端混合液回流至缺氧池", "二沉池污泥回流至缺氧池"]
+  },
+  {
+    id: "AAO",
+    label: "厌氧-缺氧-好氧工艺（A²/O）",
+    shortLabel: "A²/O",
+    category: "脱氮除磷工艺",
+    description: "依次设置厌氧、缺氧和好氧环境，实现生物除磷、反硝化和硝化。",
+    steps: ["进水", "预处理", "厌氧池", "缺氧池", "好氧池", "二沉池", "消毒", "出水"],
+    features: ["好氧末端混合液回流至缺氧池", "二沉池污泥回流至厌氧池"]
+  },
+  {
+    id: "oxidation_ditch",
+    label: "氧化沟工艺",
+    shortLabel: "氧化沟",
+    category: "活性污泥法",
+    description: "采用封闭环形沟渠连续循环曝气，具有较长泥龄并可通过分区实现硝化反硝化。",
+    steps: ["进水", "预处理", "选择池", "氧化沟", "二沉池", "消毒", "出水"],
+    features: ["沟内混合液连续循环", "二沉池污泥回流至选择池"]
+  },
+  {
+    id: "SBR",
+    label: "序批式活性污泥法（SBR）",
+    shortLabel: "SBR",
+    category: "序批式工艺",
+    description: "在同一反应池内按时间顺序完成进水、反应、沉淀、滗水和闲置。",
+    steps: ["进水", "预处理", "进水阶段", "反应阶段", "沉淀阶段", "滗水阶段", "消毒", "出水"],
+    features: ["反应与沉淀在同一池体完成", "通常不设二沉池和污泥回流系统"]
+  },
+  {
+    id: "CASS",
+    label: "循环式活性污泥法（CASS）",
+    shortLabel: "CASS",
+    category: "序批式工艺",
+    description: "SBR 的改进形式，反应池包含生物选择区和主反应区，并周期完成反应、沉淀和滗水。",
+    steps: ["进水", "预处理", "生物选择区", "兼氧区", "主反应区", "沉淀/滗水", "消毒", "出水"],
+    features: ["主反应区污泥回流至生物选择区", "主反应区按周期曝气、沉淀和滗水"]
+  },
+  {
+    id: "UCT",
+    label: "UCT 生物脱氮除磷工艺",
+    shortLabel: "UCT",
+    category: "脱氮除磷工艺",
+    description: "通过改变污泥回流位置，降低回流污泥中硝酸盐对厌氧释磷的影响。",
+    steps: ["进水", "预处理", "厌氧池", "缺氧池", "好氧池", "二沉池", "消毒", "出水"],
+    features: ["二沉池污泥回流至缺氧池", "缺氧混合液回流至厌氧池", "好氧混合液回流至缺氧池"]
+  },
+  {
+    id: "MUCT",
+    label: "改良 UCT 工艺（MUCT）",
+    shortLabel: "MUCT",
+    category: "脱氮除磷工艺",
+    description: "将缺氧区分为两段，分别处理污泥回流中的硝酸盐和好氧区内回流中的硝酸盐。",
+    steps: ["进水", "预处理", "厌氧池", "缺氧池Ⅰ", "缺氧池Ⅱ", "好氧池", "二沉池", "消毒", "出水"],
+    features: ["污泥回流至缺氧池Ⅰ", "缺氧池Ⅰ混合液回流至厌氧池", "好氧混合液回流至缺氧池Ⅱ"]
+  },
+  {
+    id: "bardenpho5",
+    label: "五段 Bardenpho 工艺",
+    shortLabel: "Bardenpho",
+    category: "脱氮除磷工艺",
+    description: "由厌氧、第一缺氧、第一好氧、第二缺氧和再曝气五段组成，强化总氮和总磷去除。",
+    steps: ["进水", "预处理", "厌氧池", "缺氧池Ⅰ", "好氧池Ⅰ", "缺氧池Ⅱ", "再曝气池", "二沉池", "消毒", "出水"],
+    features: ["好氧池Ⅰ混合液回流至缺氧池Ⅰ", "二沉池污泥回流至厌氧池"]
+  },
+  {
+    id: "MBR",
+    label: "膜生物反应器（MBR）",
+    shortLabel: "MBR",
+    category: "膜与生物膜工艺",
+    description: "以膜分离代替二沉池完成泥水分离，可维持较高污泥浓度并获得低悬浮物出水。",
+    steps: ["进水", "精细预处理", "缺氧池", "好氧池", "膜池", "消毒", "出水"],
+    features: ["膜组件代替二沉池", "膜池混合液回流至缺氧池", "需设置膜曝气和反洗"]
+  },
+  {
+    id: "MBBR",
+    label: "移动床生物膜反应器（MBBR）",
+    shortLabel: "MBBR",
+    category: "膜与生物膜工艺",
+    description: "在反应池中投加悬浮载体形成生物膜，可按缺氧和好氧分区实现脱氮。",
+    steps: ["进水", "预处理", "缺氧 MBBR", "好氧 MBBR", "二沉池", "过滤/消毒", "出水"],
+    features: ["载体由拦截筛网保留在反应池内", "好氧末端混合液回流至缺氧段"]
+  },
+  {
+    id: "IFAS",
+    label: "活性污泥-生物膜复合工艺（IFAS）",
+    shortLabel: "IFAS",
+    category: "膜与生物膜工艺",
+    description: "在活性污泥曝气池内加入生物膜载体，同时保留悬浮污泥和附着生物量。",
+    steps: ["进水", "预处理", "缺氧池", "IFAS 好氧池", "二沉池", "过滤/消毒", "出水"],
+    features: ["二沉池污泥回流以维持悬浮污泥", "载体保留附着生物量", "好氧混合液回流至缺氧池"]
+  },
+  {
+    id: "BAF",
+    label: "曝气生物滤池（BAF）",
+    shortLabel: "BAF",
+    category: "膜与生物膜工艺",
+    description: "利用固定滤料上的生物膜同步完成生化反应和过滤，可分设反硝化与硝化滤池。",
+    steps: ["进水", "预处理", "初沉/混凝沉淀", "反硝化滤池", "硝化曝气滤池", "消毒", "出水"],
+    features: ["滤池需周期反冲洗", "硝化出水回流至反硝化滤池"]
+  },
+  {
+    id: "contact_oxidation",
+    label: "生物接触氧化法",
+    shortLabel: "接触氧化",
+    category: "膜与生物膜工艺",
+    description: "在曝气池内设置固定填料培养生物膜，兼具活性污泥法和生物滤池特征。",
+    steps: ["进水", "预处理", "水解酸化池", "接触氧化池", "二沉池", "过滤/消毒", "出水"],
+    features: ["生物膜附着于固定填料", "脱氮场景可增设缺氧段和硝化液回流"]
+  },
+  {
+    id: "UASB_AO",
+    label: "UASB + A/O 组合工艺",
+    shortLabel: "UASB+A/O",
+    category: "厌氧组合工艺",
+    description: "前段 UASB 去除高浓度有机物并产沼气，后续缺氧-好氧段完成深度有机物去除和脱氮。",
+    steps: ["进水", "预处理/调节", "UASB", "缺氧池", "好氧池", "二沉池", "消毒", "出水"],
+    features: ["UASB 产生沼气和厌氧污泥", "好氧混合液回流至缺氧池", "二沉池污泥回流至缺氧池"]
+  },
+  {
+    id: "custom",
+    label: "自定义组合工艺",
+    shortLabel: "自定义",
+    category: "其他",
+    description: "用于尚未纳入预设目录的工艺路线，后续可通过流程编辑器配置具体处理单元。",
+    steps: ["进水", "预处理", "处理单元Ⅰ", "处理单元Ⅱ", "处理单元Ⅲ", "固液分离", "消毒", "出水"],
+    features: ["需进一步确认处理单元类型", "需人工配置回流关系和模型参数"]
+  }
+];
+
+const processCategories = [...new Set(processCatalog.map((item) => item.category))];
+
+function readPage(): PageId {
+  const page = window.location.hash.replace("#/", "") as PageId;
+  return pages.some((item) => item.id === page) ? page : "home";
+}
+
+function AppIcon() {
+  return (
+    <div className="app-icon" aria-hidden="true">
+      <Droplets size={21} strokeWidth={2.4} />
+    </div>
+  );
+}
+
+function PageHeading({
+  eyebrow,
+  title,
+  description,
+  action
+}: {
+  eyebrow: string;
+  title: string;
+  description: string;
+  action?: React.ReactNode;
+}) {
+  return (
+    <header className="page-heading">
+      <div>
+        <span className="eyebrow">{eyebrow}</span>
+        <h1>{title}</h1>
+        <p>{description}</p>
+      </div>
+      {action}
+    </header>
+  );
+}
+
+function HomePage({ navigate }: { navigate: (page: PageId) => void }) {
+  return (
+    <section className="entry-page">
+      <div className="entry-shade" />
+      <div className="entry-content">
+        <h1>清澜智评</h1>
+        <p>面向污水处理工艺的建模与评估平台。基于 QSDsan 标准工作流，将实测数据、稳态仿真、模型校准与工艺评价连接为清晰可靠的数字化过程。</p>
+      </div>
+      <button className="entry-button" onClick={() => navigate("project")} aria-label="进入系统" title="进入系统">
+        <ArrowRight size={23} />
+      </button>
+    </section>
+  );
+}
+
+function ProjectPage() {
+  const [processType, setProcessType] = useState("AAO");
+  const [dirty, setDirty] = useState(false);
+  const [saveState, setSaveState] = useState<"idle" | "saving" | "success" | "error">("idle");
+  const [saveMessage, setSaveMessage] = useState("");
+  const [createdProject, setCreatedProject] = useState<ProjectApiRecord | null>(null);
+  const [projectForm, setProjectForm] = useState({
+    name: "深水海纳示范污水厂",
+    code: "DSHN-2026-001",
+    owner: "C 同学",
+    location: "广东省深圳市",
+    period: "2026-07-27 至 2026-08-06",
+    description: "基于实测进出水数据，对 AAO 工艺进行稳态模拟、参数校准与达标评估。",
+    designScale: "5000"
+  });
+  const selectedProcess = processCatalog.find((item) => item.id === processType) ?? processCatalog[0];
+  const markDirty = () => {
+    setDirty(true);
+    setSaveState("idle");
+    setSaveMessage("");
+  };
+  const updateProjectField = (field: keyof typeof projectForm, value: string) => {
+    setProjectForm((current) => ({ ...current, [field]: value }));
+    markDirty();
+  };
+  const saveProject = async () => {
+    const name = projectForm.name.trim();
+    if (!name || !projectForm.owner.trim()) {
+      setSaveState("error");
+      setSaveMessage("请先填写项目名称和项目负责人。");
+      return;
+    }
+
+    setSaveState("saving");
+    setSaveMessage("");
+    const projectPayload = {
+      name,
+      plant_name: name,
+      process_type: processType,
+      owner: projectForm.owner.trim(),
+      description: projectForm.description.trim() || null
+    };
+
+    if (isStaticDeployment && !apiBaseUrl) {
+      const record: ProjectApiRecord = {
+        ...projectPayload,
+        id: crypto.randomUUID(),
+        created_at: new Date().toISOString(),
+        storage_mode: "local"
+      };
+      localStorage.setItem("qinglan-current-project", JSON.stringify(record));
+      setCreatedProject(record);
+      setDirty(false);
+      setSaveState("success");
+      setSaveMessage(`项目已保存在当前浏览器，ID：${record.id}`);
+      window.setTimeout(() => setSaveState("idle"), 4000);
+      return;
+    }
+
+    try {
+      const response = await fetch(`${apiBaseUrl}/api/projects`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(projectPayload)
+      });
+
+      if (!response.ok) {
+        const body = await response.json().catch(() => null);
+        const detail = typeof body?.detail === "string" ? body.detail : `接口返回 ${response.status}`;
+        throw new Error(detail);
+      }
+
+      const record = await response.json() as ProjectApiRecord;
+      setCreatedProject(record);
+      setDirty(false);
+      setSaveState("success");
+      setSaveMessage(`项目已创建，ID：${record.id}`);
+      window.setTimeout(() => setSaveState("idle"), 4000);
+    } catch (error) {
+      setSaveState("error");
+      setSaveMessage(error instanceof Error ? `保存失败：${error.message}` : "保存失败，请检查后端服务。");
+    }
+  };
+
+  return (
+    <div className="page">
+      <PageHeading eyebrow="01 / 项目建档" title="项目概览" description="定义评估对象、工艺路线与模型边界，形成后续数据录入和仿真计算的统一项目上下文。"
+        action={<button className="button primary" onClick={saveProject} disabled={saveState === "saving"}>
+          <Save size={17} /> {saveState === "saving" ? "正在保存..." : dirty || !createdProject ? "保存项目" : "已保存"}
+        </button>} />
+
+      {saveState === "success" && <div className="save-toast" role="status"><CheckCircle2 size={17} /> {saveMessage}</div>}
+      {saveState === "error" && <div className="save-toast error" role="alert"><span>!</span> {saveMessage}</div>}
+
+      <section className="project-summary" aria-label="项目状态摘要">
+        <div className="project-identity">
+          <span className="project-mark"><Building2 size={22} /></span>
+          <div><small>当前项目</small><strong>{projectForm.name || "未命名项目"}</strong><span><i /> {createdProject ? createdProject.storage_mode === "local" ? "已保存到浏览器" : "已在后端创建" : "建模准备中"}</span></div>
+        </div>
+        <div><small>处理工艺</small><strong>{selectedProcess.shortLabel}</strong><span>{selectedProcess.category}</span></div>
+        <div><small>设计规模</small><strong>{Number(projectForm.designScale || 0).toLocaleString()}</strong><span>m³/d</span></div>
+        <div><small>评价标准</small><strong>一级 A</strong><span>GB 18918-2002</span></div>
+        <div><small>资料完整度</small><strong>78%</strong><span className="mini-progress"><i /></span></div>
+      </section>
+
+      <section className="form-section">
+        <div className="section-title"><div><h2>基本信息</h2><p>用于项目检索、成果归档和报告封面</p></div><span className="required-note">* 必填项</span></div>
+        <div className="form-grid">
+          <label className="field wide"><span>项目名称 *</span><input value={projectForm.name} onChange={(event) => updateProjectField("name", event.target.value)} /></label>
+          <label className="field"><span>项目编号 *</span><input value={projectForm.code} onChange={(event) => updateProjectField("code", event.target.value)} /></label>
+          <label className="field"><span>项目负责人 *</span><input value={projectForm.owner} onChange={(event) => updateProjectField("owner", event.target.value)} /></label>
+          <label className="field"><span>项目地点</span><div className="field-with-icon"><MapPin size={15} /><input value={projectForm.location} onChange={(event) => updateProjectField("location", event.target.value)} /></div></label>
+          <label className="field"><span>建模周期</span><div className="field-with-icon"><CalendarDays size={15} /><input value={projectForm.period} onChange={(event) => updateProjectField("period", event.target.value)} /></div></label>
+          <label className="field wide"><span>项目描述</span><textarea value={projectForm.description} onChange={(event) => updateProjectField("description", event.target.value)} /></label>
+        </div>
+      </section>
+
+      <section className="form-section">
+        <div className="section-title"><div><h2>工艺路线</h2><p>选择主体工艺并确认模型中的处理单元顺序</p></div><span className="process-tag">稳态模型</span></div>
+        <div className="form-grid three">
+          <label className="field process-select-field"><span>主体工艺 *</span>
+            <select value={processType} onChange={(event) => { setProcessType(event.target.value); markDirty(); }}>
+              {processCategories.map((category) => (
+                <optgroup label={category} key={category}>
+                  {processCatalog.filter((item) => item.category === category).map((item) => (
+                    <option value={item.id} key={item.id}>{item.label}</option>
+                  ))}
+                </optgroup>
+              ))}
+            </select>
+            <ChevronDown size={16} />
+          </label>
+          <label className="field"><span>设计规模 *</span><div className="input-unit"><input value={projectForm.designScale} onChange={(event) => updateProjectField("designScale", event.target.value)} /><b>m³/d</b></div></label>
+          <label className="field"><span>污水类型</span><select defaultValue="municipal" onChange={markDirty}><option value="municipal">市政生活污水</option><option value="industrial">工业废水</option><option value="mixed">混合污水</option></select><ChevronDown size={16} /></label>
+        </div>
+        <div className="process-definition">
+          <strong>{selectedProcess.label}</strong>
+          <p>{selectedProcess.description}</p>
+        </div>
+        <div className="process-flow" aria-label={`${selectedProcess.label}工艺流程`}>
+          {selectedProcess.steps.map((item, index) => (
+            <div key={`${item}-${index}`}><span>{index + 1}</span><strong>{item}</strong>{index < selectedProcess.steps.length - 1 && <ArrowRight size={18} />}</div>
+          ))}
+        </div>
+        <div className="process-features">
+          <span>关键结构</span>
+          <div>{selectedProcess.features.map((feature) => <small key={feature}><CheckCircle2 size={14} />{feature}</small>)}</div>
+        </div>
+        <div className="process-note"><CircleHelp size={16} /><span>流程展示包含主体生化段及必要的前后处理。实际建模时，各处理单元和回流关系将映射为 QSDsan System 中的 SanUnit 与 Stream。</span></div>
+        {createdProject && (
+          <div className="backend-record">
+            <Database size={16} />
+            <span><strong>{createdProject.storage_mode === "local" ? "浏览器项目记录" : "后端项目记录"}</strong>ID：{createdProject.id}</span>
+            <small>创建于 {new Date(createdProject.created_at).toLocaleString("zh-CN")}</small>
+          </div>
+        )}
+      </section>
+
+      <div className="project-detail-grid">
+        <section className="form-section model-scope">
+          <div className="section-title"><div><h2>模型与评价范围</h2><p>明确本次计算包含的系统边界和成果指标</p></div><Target size={19} /></div>
+          <div className="form-grid">
+            <label className="field"><span>仿真模式 *</span><select defaultValue="steady" onChange={markDirty}><option value="steady">稳态仿真</option><option value="dynamic" disabled>动态仿真（后续升级）</option></select><ChevronDown size={16} /></label>
+            <label className="field"><span>排放标准 *</span><select defaultValue="grade-a" onChange={markDirty}><option value="grade-a">GB 18918-2002 一级 A</option><option value="grade-b">GB 18918-2002 一级 B</option><option value="custom">自定义限值</option></select><ChevronDown size={16} /></label>
+          </div>
+          <fieldset className="scope-options">
+            <legend>系统边界</legend>
+            {["水线处理单元", "污泥产量核算", "曝气能耗核算", "药剂消耗核算"].map((item, index) => (
+              <label key={item}><input type="checkbox" defaultChecked={index < 3} onChange={markDirty} /><span><CheckCircle2 size={15} />{item}</span></label>
+            ))}
+          </fieldset>
+          <fieldset className="scope-options">
+            <legend>评价指标</legend>
+            {["COD / BOD₅ 去除", "脱氮效果", "除磷效果", "TSS 达标", "单位水量能耗", "污泥产量"].map((item) => (
+              <label key={item}><input type="checkbox" defaultChecked onChange={markDirty} /><span><CheckCircle2 size={15} />{item}</span></label>
+            ))}
+          </fieldset>
+        </section>
+
+        <aside className="readiness-panel">
+          <div className="section-title"><div><h2>数据准备度</h2><p>运行模型前的必要条件</p></div><Database size={19} /></div>
+          <div className="readiness-score"><strong>78%</strong><span><i /></span><small>5 项已就绪，2 项待完善</small></div>
+          <div className="readiness-list">
+            {[
+              ["项目及工艺信息", "已完成", true],
+              ["进水水质数据", "已录入", true],
+              ["运行参数", "已录入", true],
+              ["出水实测数据", "待补充", false],
+              ["模型组分映射", "已配置", true],
+              ["排放限值", "已配置", true],
+              ["校准参数范围", "待确认", false]
+            ].map(([name, state, ready]) => (
+              <div key={String(name)}><span className={ready ? "ready" : "pending"}>{ready ? <CheckCircle2 size={15} /> : "!"}</span><strong>{name}</strong><small>{state}</small></div>
+            ))}
+          </div>
+          <button className="button secondary full-button"><Database size={16} /> 查看数据清单</button>
+        </aside>
+      </div>
+    </div>
+  );
+}
+
+function InputPage({ navigate }: { navigate: (page: PageId) => void }) {
+  const [indicators, setIndicators] = useState(initialIndicators);
+  const updateValue = (key: string, value: string) =>
+    setIndicators((items) => items.map((item) => item.key === key ? { ...item, value } : item));
+
+  return (
+    <div className="page">
+      <PageHeading eyebrow="02 / 数据准备" title="数据录入" description="录入进水水质和工艺运行参数。所有数值均采用每日平均值。"
+        action={<div className="heading-actions"><button className="button secondary"><Upload size={17} /> 导入 Excel</button><button className="button primary"><Save size={17} /> 保存数据</button></div>} />
+      <div className="info-banner"><CircleHelp size={18} /><span>当前数据集：2026 年 7 月日均监测数据</span><button>切换数据集</button></div>
+      <section className="form-section">
+        <div className="section-title"><div><h2>进水水质</h2><p>用于构建 QSDsan 进水流对象的组分浓度</p></div><span className="validation-ok"><CheckCircle2 size={16} /> 数据格式正常</span></div>
+        <div className="indicator-grid">
+          {indicators.map((item) => (
+            <label className="indicator-field" key={item.key}>
+              <span>{item.name}</span>
+              <div><input value={item.value} onChange={(event) => updateValue(item.key, event.target.value)} /><b>{item.unit}</b></div>
+            </label>
+          ))}
+        </div>
+      </section>
+      <section className="form-section">
+        <div className="section-title"><div><h2>运行参数</h2><p>用于设定反应器停留时间、污泥龄与回流条件</p></div></div>
+        <div className="indicator-grid parameters">
+          {[["水力停留时间", "12", "h"], ["污泥龄", "15", "d"], ["内回流比", "200", "%"], ["污泥回流比", "80", "%"], ["曝气功率", "15", "kW"]].map(([name, value, unit]) => (
+            <label className="indicator-field" key={name}><span>{name}</span><div><input defaultValue={value} /><b>{unit}</b></div></label>
+          ))}
+        </div>
+      </section>
+      <div className="page-footer-actions">
+        <span>已填写 14 / 14 项必需参数</span>
+        <button className="button primary" onClick={() => navigate("result")}><Play size={17} fill="currentColor" /> 运行稳态仿真</button>
+      </div>
+    </div>
+  );
+}
+
+function ResultPage({ navigate }: { navigate: (page: PageId) => void }) {
+  const maxValue = Math.max(...resultRows.map((row) => row.inlet));
+  return (
+    <div className="page">
+      <PageHeading eyebrow="03 / 模型计算" title="仿真结果" description="查看稳态模型预测、污染物去除效果及出水达标情况。"
+        action={<div className="heading-actions"><button className="button secondary"><SlidersHorizontal size={17} /> 校准模型</button><button className="button primary"><Play size={17} fill="currentColor" /> 重新计算</button></div>} />
+      <div className="run-summary">
+        <div><span className="success-pulse" /><p><strong>计算成功</strong><small>运行耗时 0.82 s · 2026-07-27 14:32</small></p></div>
+        <span>模型版本 <b>Steady-state v0.1</b></span>
+      </div>
+      <div className="result-metrics">
+        <div><Gauge size={20} /><span>综合达标率</span><strong>40%</strong><small>2 / 5 项达标</small></div>
+        <div><Droplets size={20} /><span>预测处理水量</span><strong>5,000</strong><small>m³/d</small></div>
+        <div><Activity size={20} /><span>运行能耗</span><strong>360</strong><small>kWh/d</small></div>
+        <div><ClipboardCheck size={20} /><span>干污泥产量</span><strong>810</strong><small>kg/d</small></div>
+      </div>
+      <section className="result-section">
+        <div className="section-title"><div><h2>进出水对比</h2><p>预测出水与当前排放限值对照</p></div><div className="legend"><span className="inlet-key" />进水 <span className="outlet-key" />预测出水</div></div>
+        <div className="result-bars">
+          {resultRows.map((row) => (
+            <div className="bar-row" key={row.name}>
+              <strong>{row.name}</strong>
+              <div className="bars">
+                <span className="inlet-bar" style={{ width: `${Math.max(8, row.inlet / maxValue * 100)}%` }} />
+                <span className="outlet-bar" style={{ width: `${Math.max(3, row.outlet / maxValue * 100)}%` }} />
+              </div>
+              <span>{row.inlet} → <b>{row.outlet}</b> {row.unit}</span>
+              <em className={row.pass ? "pass" : "fail"}>{row.pass ? "达标" : "超标"}</em>
+            </div>
+          ))}
+        </div>
+      </section>
+      <div className="result-note"><span>!</span><p><strong>校准建议</strong>TN、TP 和 TSS 预测出水超过限值，建议结合实测出水数据执行参数校准后重新计算。</p><button className="text-button" onClick={() => navigate("report")}>查看评估报告 <ArrowRight size={15} /></button></div>
+    </div>
+  );
+}
+
+function ReportPage() {
+  const [format, setFormat] = useState("pdf");
+  return (
+    <div className="page">
+      <PageHeading eyebrow="04 / 成果输出" title="报告导出" description="整理项目参数、仿真结果和评估结论，生成标准化成果文件。" />
+      <div className="report-layout">
+        <section className="form-section">
+          <div className="section-title"><div><h2>报告配置</h2><p>选择报告内容与输出格式</p></div></div>
+          <label className="field"><span>报告名称</span><input defaultValue="深水海纳示范污水厂工艺建模评估报告" /></label>
+          <fieldset className="check-list">
+            <legend>包含章节</legend>
+            {["项目与工艺概况", "进水水质与运行参数", "稳态仿真结果", "污染物去除与达标分析", "模型校准指标", "结论与优化建议"].map((item) => (
+              <label key={item}><input type="checkbox" defaultChecked /><span><CheckCircle2 size={15} />{item}</span></label>
+            ))}
+          </fieldset>
+          <fieldset className="format-picker">
+            <legend>输出格式</legend>
+            <label className={format === "pdf" ? "selected" : ""}><input type="radio" name="format" value="pdf" checked={format === "pdf"} onChange={() => setFormat("pdf")} /><FileText size={22} /><span><strong>PDF 报告</strong><small>适合汇报与归档</small></span></label>
+            <label className={format === "excel" ? "selected" : ""}><input type="radio" name="format" value="excel" checked={format === "excel"} onChange={() => setFormat("excel")} /><FileSpreadsheet size={22} /><span><strong>Excel 数据</strong><small>适合复核与二次分析</small></span></label>
+          </fieldset>
+          <button className="button primary full-button"><FileDown size={18} /> 生成并下载{format === "pdf" ? " PDF 报告" : " Excel 数据"}</button>
+        </section>
+        <aside className="report-preview">
+          <div className="preview-toolbar"><span>报告预览</span><small>A4 · 共 12 页</small></div>
+          <div className="paper">
+            <AppIcon />
+            <span>QSDsan 标准工作流</span>
+            <h2>污水工艺流程<br />建模评估报告</h2>
+            <div className="paper-line" />
+            <strong>深水海纳示范污水厂</strong>
+            <p>AAO 工艺 · 稳态仿真模型</p>
+            <footer><span>编制日期</span><b>2026 年 7 月</b></footer>
+          </div>
+        </aside>
+      </div>
+    </div>
+  );
+}
+
+export function App() {
+  const [page, setPage] = useState<PageId>(readPage);
+  const [menuOpen, setMenuOpen] = useState(false);
+
+  useEffect(() => {
+    const onHashChange = () => setPage(readPage());
+    window.addEventListener("hashchange", onHashChange);
+    return () => window.removeEventListener("hashchange", onHashChange);
+  }, []);
+
+  const currentLabel = useMemo(() => pages.find((item) => item.id === page)?.label, [page]);
+  const navigate = (next: PageId) => {
+    window.location.hash = `/${next}`;
+    setPage(next);
+    setMenuOpen(false);
+    window.scrollTo({ top: 0, behavior: "smooth" });
+  };
+
+  if (page === "home") {
+    return <HomePage navigate={navigate} />;
+  }
+
+  return (
+    <main className="app-shell">
+      <aside className={`sidebar ${menuOpen ? "open" : ""}`} aria-label="功能导航">
+        <div className="brand"><AppIcon /><div><strong>清澜智评</strong><small>WATER PROCESS STUDIO</small></div></div>
+        <button className="mobile-close" onClick={() => setMenuOpen(false)} aria-label="关闭菜单"><X size={20} /></button>
+        <nav>
+          <span className="nav-label">主要功能</span>
+          {pages.map((item) => (
+            <button className={page === item.id ? "active" : ""} key={item.id} onClick={() => navigate(item.id)}>
+              <item.icon size={18} /><span>{item.label}</span>{page === item.id && <i />}
+            </button>
+          ))}
+        </nav>
+        <div className="sidebar-project">
+          <span>当前项目</span>
+          <strong>深水海纳示范污水厂</strong>
+          <small><span /> AAO · 稳态模型</small>
+        </div>
+        <footer><button><CircleHelp size={17} /> 使用帮助</button><span>v0.1.0 · MVP</span></footer>
+      </aside>
+      {menuOpen && <button className="scrim" aria-label="关闭菜单" onClick={() => setMenuOpen(false)} />}
+
+      <section className="workspace">
+        <div className="mobile-bar">
+          <button onClick={() => setMenuOpen(true)} aria-label="打开菜单"><Menu size={21} /></button>
+          <span>{currentLabel}</span>
+          <AppIcon />
+        </div>
+        {page === "project" && <ProjectPage />}
+        {page === "input" && <InputPage navigate={navigate} />}
+        {page === "result" && <ResultPage navigate={navigate} />}
+        {page === "report" && <ReportPage />}
+      </section>
+    </main>
+  );
+}
