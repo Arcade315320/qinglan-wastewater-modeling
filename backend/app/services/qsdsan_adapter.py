@@ -1,5 +1,6 @@
 import platform
 from contextlib import contextmanager
+from importlib.metadata import PackageNotFoundError, version
 from threading import Lock
 
 from app.models.schemas import (
@@ -37,20 +38,24 @@ ZONE_FRACTIONS: dict[ProcessType, tuple[float, float, float]] = {
 
 def get_engine_status() -> ModelEngineStatus:
     try:
-        import exposan
-        import qsdsan
+        qsdsan_version = version("qsdsan")
+        exposan_version = version("exposan")
     except Exception as error:
+        if not isinstance(error, PackageNotFoundError):
+            detail = f"{type(error).__name__}: {error}"
+        else:
+            detail = f"PackageNotFoundError: {error}"
         return ModelEngineStatus(
             available=False,
             package="qsdsan/exposan",
             python_version=platform.python_version(),
-            detail=f"{type(error).__name__}: {error}",
+            detail=detail,
         )
 
     return ModelEngineStatus(
         available=True,
         package="qsdsan/exposan",
-        version=f"{qsdsan.__version__}/{exposan.__version__}",
+        version=f"{qsdsan_version}/{exposan_version}",
         python_version=platform.python_version(),
         detail="QSDsan dynamic units and the official EXPOsan BSM1 system are available.",
     )
