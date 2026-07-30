@@ -27,7 +27,16 @@ import {
   Upload,
   X
 } from "lucide-react";
-import { useEffect, useMemo, useState } from "react";
+import { createContext, useContext, useEffect, useMemo, useState } from "react";
+import {
+  api,
+  apiUrl,
+  type CalibrationSample,
+  type ProcessParameters,
+  type ProjectRecord,
+  type SimulationResult,
+  type WaterQuality
+} from "../api";
 
 type PageId = "home" | "project" | "input" | "result" | "report";
 
@@ -51,27 +60,26 @@ const initialIndicators = [
   { name: "水温", key: "temperature", value: "22", unit: "°C" }
 ];
 
-const resultRows = [
-  { name: "COD", inlet: 260, outlet: 36.4, limit: 50, unit: "mg/L", pass: true },
-  { name: "NH₄-N", inlet: 32, outlet: 3.84, limit: 5, unit: "mg/L", pass: true },
-  { name: "TN", inlet: 48, outlet: 15.36, limit: 15, unit: "mg/L", pass: false },
-  { name: "TP", inlet: 4.2, outlet: 1.18, limit: 0.5, unit: "mg/L", pass: false },
-  { name: "TSS", inlet: 180, outlet: 18, limit: 10, unit: "mg/L", pass: false }
-];
-
-type ProjectApiRecord = {
-  id: string;
-  name: string;
-  plant_name: string;
-  process_type: string;
-  owner: string | null;
-  description: string | null;
-  created_at: string;
-  storage_mode?: "api" | "local";
+type WorkflowContextValue = {
+  project: ProjectRecord | null;
+  setProject: (project: ProjectRecord | null) => void;
+  influent: WaterQuality | null;
+  setInfluent: (influent: WaterQuality) => void;
+  parameters: ProcessParameters | null;
+  setParameters: (parameters: ProcessParameters) => void;
+  simulation: SimulationResult | null;
+  setSimulation: (simulation: SimulationResult | null) => void;
+  calibrationSamples: CalibrationSample[];
+  setCalibrationSamples: (samples: CalibrationSample[]) => void;
 };
 
-const apiBaseUrl = (import.meta.env.VITE_API_BASE_URL as string | undefined)?.replace(/\/$/, "") ?? "";
-const isStaticDeployment = window.location.hostname.endsWith("github.io");
+const WorkflowContext = createContext<WorkflowContextValue | null>(null);
+
+function useWorkflow() {
+  const value = useContext(WorkflowContext);
+  if (!value) throw new Error("Workflow context is unavailable");
+  return value;
+}
 
 type ProcessDefinition = {
   id: string;
@@ -284,11 +292,11 @@ function HomePage({ navigate }: { navigate: (page: PageId) => void }) {
 }
 
 function ProjectPage() {
+  const { project: createdProject, setProject } = useWorkflow();
   const [processType, setProcessType] = useState("AAO");
   const [dirty, setDirty] = useState(false);
   const [saveState, setSaveState] = useState<"idle" | "saving" | "success" | "error">("idle");
   const [saveMessage, setSaveMessage] = useState("");
-  const [createdProject, setCreatedProject] = useState<ProjectApiRecord | null>(null);
   const [projectForm, setProjectForm] = useState({
     name: "深水海纳示范污水厂",
     code: "DSHN-2026-001",
@@ -326,37 +334,9 @@ function ProjectPage() {
       description: projectForm.description.trim() || null
     };
 
-    if (isStaticDeployment && !apiBaseUrl) {
-      const record: ProjectApiRecord = {
-        ...projectPayload,
-        id: crypto.randomUUID(),
-        created_at: new Date().toISOString(),
-        storage_mode: "local"
-      };
-      localStorage.setItem("qinglan-current-project", JSON.stringify(record));
-      setCreatedProject(record);
-      setDirty(false);
-      setSaveState("success");
-      setSaveMessage(`项目已保存在当前浏览器，ID：${record.id}`);
-      window.setTimeout(() => setSaveState("idle"), 4000);
-      return;
-    }
-
     try {
-      const response = await fetch(`${apiBaseUrl}/api/projects`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(projectPayload)
-      });
-
-      if (!response.ok) {
-        const body = await response.json().catch(() => null);
-        const detail = typeof body?.detail === "string" ? body.detail : `接口返回 ${response.status}`;
-        throw new Error(detail);
-      }
-
-      const record = await response.json() as ProjectApiRecord;
-      setCreatedProject(record);
+      const record = await api.createProject(projectPayload);
+      setProject(record);
       setDirty(false);
       setSaveState("success");
       setSaveMessage(`项目已创建，ID：${record.id}`);
@@ -380,7 +360,7 @@ function ProjectPage() {
       <section className="project-summary" aria-label="项目状态摘要">
         <div className="project-identity">
           <span className="project-mark"><Building2 size={22} /></span>
-          <div><small>当前项目</small><strong>{projectForm.name || "未命名项目"}</strong><span><i /> {createdProject ? createdProject.storage_mode === "local" ? "已保存到浏览器" : "已在后端创建" : "建模准备中"}</span></div>
+        <div><small>当前项目</small><strong>{projectForm.name || "未命名项目"}</strong><span><i /> {createdProject ? "已在后端创建" : "建模准备中"}</span></div>
         </div>
         <div><small>处理工艺</small><strong>{selectedProcess.shortLabel}</strong><span>{selectedProcess.category}</span></div>
         <div><small>设计规模</small><strong>{Number(projectForm.designScale || 0).toLocaleString()}</strong><span>m³/d</span></div>
@@ -435,7 +415,7 @@ function ProjectPage() {
         {createdProject && (
           <div className="backend-record">
             <Database size={16} />
-            <span><strong>{createdProject.storage_mode === "local" ? "浏览器项目记录" : "后端项目记录"}</strong>ID：{createdProject.id}</span>
+            <span><strong>后端项目记录</strong>ID：{createdProject.id}</span>
             <small>创建于 {new Date(createdProject.created_at).toLocaleString("zh-CN")}</small>
           </div>
         )}
@@ -486,14 +466,120 @@ function ProjectPage() {
 }
 
 function InputPage({ navigate }: { navigate: (page: PageId) => void }) {
+  const {
+    project,
+    setInfluent,
+    setParameters,
+    setSimulation,
+    setCalibrationSamples
+  } = useWorkflow();
   const [indicators, setIndicators] = useState(initialIndicators);
+  const [parameterValues, setParameterValues] = useState({
+    hrt: "12",
+    srt: "15",
+    internalRecycle: "200",
+    sludgeRecycle: "80",
+    aerationPower: "15",
+    dissolvedOxygen: "2",
+    alkalinity: "250",
+    simulationDays: "50"
+  });
+  const [runState, setRunState] = useState<"idle" | "saving" | "running" | "error">("idle");
+  const [message, setMessage] = useState("");
   const updateValue = (key: string, value: string) =>
     setIndicators((items) => items.map((item) => item.key === key ? { ...item, value } : item));
+  const numericValue = (key: string) => Number(indicators.find((item) => item.key === key)?.value ?? 0);
+  const buildPayload = () => {
+    const waterQuality: WaterQuality = {
+      flow_m3_d: numericValue("flow"),
+      cod_mg_l: numericValue("cod"),
+      bod_mg_l: numericValue("bod"),
+      nh4_n_mg_l: numericValue("nh4"),
+      tn_mg_l: numericValue("tn"),
+      tp_mg_l: numericValue("tp"),
+      tss_mg_l: numericValue("tss"),
+      ph: numericValue("ph"),
+      temperature_c: numericValue("temperature")
+    };
+    const phosphorusProcesses = new Set(["AAO", "SBR", "CASS", "UCT", "MUCT", "bardenpho5", "MBR", "IFAS"]);
+    const processParameters: ProcessParameters = {
+      process_type: project?.process_type ?? "AAO",
+      model_type: phosphorusProcesses.has(project?.process_type ?? "AAO") ? "ASM2d" : "ASM1",
+      hrt_h: Number(parameterValues.hrt),
+      srt_d: Number(parameterValues.srt),
+      internal_recycle_ratio: Number(parameterValues.internalRecycle) / 100,
+      sludge_recycle_ratio: Number(parameterValues.sludgeRecycle) / 100,
+      aeration_power_kw: Number(parameterValues.aerationPower),
+      aerobic_do_mg_l: Number(parameterValues.dissolvedOxygen),
+      alkalinity_mg_l_caco3: Number(parameterValues.alkalinity),
+      simulation_days: Number(parameterValues.simulationDays),
+      cod_kinetic_factor: 1,
+      nitrification_kinetic_factor: 1,
+      denitrification_kinetic_factor: 1,
+      phosphorus_kinetic_factor: 1
+    };
+    return { waterQuality, processParameters };
+  };
+  const saveMeasurement = async () => {
+    if (!project) throw new Error("请先在项目概览中保存项目。");
+    const { waterQuality, processParameters } = buildPayload();
+    await api.createMeasurement(project.id, waterQuality);
+    setInfluent(waterQuality);
+    setParameters(processParameters);
+  };
+  const saveData = async () => {
+    setRunState("saving");
+    setMessage("");
+    try {
+      await saveMeasurement();
+      setRunState("idle");
+      setMessage("进水数据已保存到后端。");
+    } catch (error) {
+      setRunState("error");
+      setMessage(error instanceof Error ? error.message : "数据保存失败。");
+    }
+  };
+  const runSimulation = async () => {
+    setRunState("running");
+    setMessage("正在执行动态积分，通常需要数秒至一分钟。");
+    try {
+      if (!project) throw new Error("请先在项目概览中保存项目。");
+      const { waterQuality, processParameters } = buildPayload();
+      await api.createMeasurement(project.id, waterQuality);
+      setInfluent(waterQuality);
+      setParameters(processParameters);
+      const result = await api.simulate(project.id, waterQuality, processParameters);
+      setSimulation(result);
+      setRunState("idle");
+      setMessage("");
+      navigate("result");
+    } catch (error) {
+      setRunState("error");
+      setMessage(error instanceof Error ? error.message : "仿真失败，请检查后端服务。");
+    }
+  };
+  const importWorkbook = async (file: File | undefined) => {
+    if (!file) return;
+    setRunState("saving");
+    setMessage("正在检查表格中的日期配对和必填指标...");
+    try {
+      if (!project) throw new Error("请先在项目概览中保存项目。");
+      const result = await api.importCalibration(project.id, file);
+      setCalibrationSamples(result.samples);
+      setRunState("idle");
+      setMessage(
+        `已导入 ${result.imported_count} 条可校准记录，跳过 ${result.skipped_count} 条。${result.warnings[0] ?? ""}`
+      );
+    } catch (error) {
+      setRunState("error");
+      setMessage(error instanceof Error ? error.message : "表格导入失败。");
+    }
+  };
 
   return (
     <div className="page">
       <PageHeading eyebrow="02 / 数据准备" title="数据录入" description="录入进水水质和工艺运行参数。所有数值均采用每日平均值。"
-        action={<div className="heading-actions"><button className="button secondary"><Upload size={17} /> 导入 Excel</button><button className="button primary"><Save size={17} /> 保存数据</button></div>} />
+        action={<div className="heading-actions"><label className="button secondary file-button"><Upload size={17} /> 导入校准表格<input type="file" accept=".xlsx" onChange={(event) => importWorkbook(event.target.files?.[0])} /></label><button className="button primary" onClick={saveData} disabled={runState === "saving" || runState === "running"}><Save size={17} /> {runState === "saving" ? "处理中..." : "保存数据"}</button></div>} />
       <div className="info-banner"><CircleHelp size={18} /><span>当前数据集：2026 年 7 月日均监测数据</span><button>切换数据集</button></div>
       <section className="form-section">
         <div className="section-title"><div><h2>进水水质</h2><p>用于构建 QSDsan 进水流对象的组分浓度</p></div><span className="validation-ok"><CheckCircle2 size={16} /> 数据格式正常</span></div>
@@ -509,34 +595,137 @@ function InputPage({ navigate }: { navigate: (page: PageId) => void }) {
       <section className="form-section">
         <div className="section-title"><div><h2>运行参数</h2><p>用于设定反应器停留时间、污泥龄与回流条件</p></div></div>
         <div className="indicator-grid parameters">
-          {[["水力停留时间", "12", "h"], ["污泥龄", "15", "d"], ["内回流比", "200", "%"], ["污泥回流比", "80", "%"], ["曝气功率", "15", "kW"]].map(([name, value, unit]) => (
-            <label className="indicator-field" key={name}><span>{name}</span><div><input defaultValue={value} /><b>{unit}</b></div></label>
+          {[
+            ["水力停留时间", "hrt", "h"],
+            ["污泥龄", "srt", "d"],
+            ["内回流比", "internalRecycle", "%"],
+            ["污泥回流比", "sludgeRecycle", "%"],
+            ["曝气功率", "aerationPower", "kW"],
+            ["好氧池溶解氧", "dissolvedOxygen", "mg/L"],
+            ["碱度", "alkalinity", "mg/L"],
+            ["动态积分时长", "simulationDays", "d"]
+          ].map(([name, key, unit]) => (
+            <label className="indicator-field" key={name}><span>{name}</span><div><input value={parameterValues[key as keyof typeof parameterValues]} onChange={(event) => setParameterValues((current) => ({ ...current, [key]: event.target.value }))} /><b>{unit}</b></div></label>
           ))}
         </div>
       </section>
+      {message && <div className={`save-toast inline ${runState === "error" ? "error" : ""}`} role="status">{runState === "error" ? <span>!</span> : <CheckCircle2 size={17} />}{message}</div>}
       <div className="page-footer-actions">
-        <span>已填写 14 / 14 项必需参数</span>
-        <button className="button primary" onClick={() => navigate("result")}><Play size={17} fill="currentColor" /> 运行稳态仿真</button>
+        <span>计算将调用 QSDsan 动态系统并执行质量守恒检查</span>
+        <button className="button primary" onClick={runSimulation} disabled={runState === "running"}><Play size={17} fill="currentColor" /> {runState === "running" ? "正在计算..." : "运行动态仿真"}</button>
       </div>
     </div>
   );
 }
 
 function ResultPage({ navigate }: { navigate: (page: PageId) => void }) {
+  const {
+    project,
+    influent,
+    parameters,
+    setParameters,
+    simulation,
+    setSimulation,
+    calibrationSamples,
+    setCalibrationSamples
+  } = useWorkflow();
+  const [calibrationOpen, setCalibrationOpen] = useState(false);
+  const [calibrationState, setCalibrationState] = useState<"idle" | "running" | "error" | "success">("idle");
+  const [calibrationMessage, setCalibrationMessage] = useState("");
+  const [groupId, setGroupId] = useState(project?.plant_name ?? "当前污水厂");
+  const [measured, setMeasured] = useState({
+    cod_mg_l: "",
+    nh4_n_mg_l: "",
+    tn_mg_l: "",
+    tp_mg_l: "",
+    tss_mg_l: ""
+  });
+  if (!simulation || !influent) {
+    return (
+      <div className="page empty-state">
+        <FlaskConical size={32} />
+        <h1>尚无真实仿真结果</h1>
+        <p>请先保存项目并在数据录入页运行动态仿真。</p>
+        <button className="button primary" onClick={() => navigate("input")}>前往数据录入</button>
+      </div>
+    );
+  }
+  const resultRows = [
+    { name: "COD", inlet: influent.cod_mg_l, outlet: simulation.effluent.cod_mg_l, limit: 50, key: "cod" },
+    { name: "NH₄-N", inlet: influent.nh4_n_mg_l, outlet: simulation.effluent.nh4_n_mg_l, limit: 5, key: "nh4_n" },
+    { name: "TN", inlet: influent.tn_mg_l, outlet: simulation.effluent.tn_mg_l, limit: 15, key: "tn" },
+    { name: "TP", inlet: influent.tp_mg_l, outlet: simulation.effluent.tp_mg_l, limit: 0.5, key: "tp" },
+    { name: "TSS", inlet: influent.tss_mg_l, outlet: simulation.effluent.tss_mg_l, limit: 10, key: "tss" }
+  ].map((row) => ({ ...row, unit: "mg/L", pass: simulation.compliance[row.key] }));
   const maxValue = Math.max(...resultRows.map((row) => row.inlet));
+  const passCount = resultRows.filter((row) => row.pass).length;
+  const addCalibrationSample = () => {
+    if (!parameters) return;
+    const values = Object.fromEntries(
+      Object.entries(measured)
+        .filter(([, value]) => value !== "")
+        .map(([key, value]) => [key, Number(value)])
+    );
+    if (!Object.keys(values).length) {
+      setCalibrationState("error");
+      setCalibrationMessage("请至少填写一项实测出水指标。");
+      return;
+    }
+    const sample: CalibrationSample = {
+      group_id: groupId.trim() || "当前污水厂",
+      sample_time: new Date().toISOString(),
+      influent,
+      measured: values,
+      parameters
+    };
+    const next = [...calibrationSamples, sample];
+    setCalibrationSamples(next);
+    setCalibrationState("success");
+    setCalibrationMessage(`已加入第 ${next.length} 条校准样本；至少两条可拟合，五条以上才会保留验证时段。`);
+  };
+  const runCalibration = async () => {
+    if (!project || calibrationSamples.length < 2) {
+      setCalibrationState("error");
+      setCalibrationMessage("至少需要两条校准样本。");
+      return;
+    }
+    setCalibrationState("running");
+    setCalibrationMessage("正在按污水厂分组并保留最新日期作为验证集...");
+    try {
+      const result = await api.calibrate(project.id, calibrationSamples);
+      if (!parameters) throw new Error("当前仿真参数不存在。");
+      const calibratedParameters: ProcessParameters = {
+        ...parameters,
+        cod_kinetic_factor: result.factors.cod,
+        nitrification_kinetic_factor: result.factors.nitrification,
+        denitrification_kinetic_factor: result.factors.denitrification,
+        phosphorus_kinetic_factor: result.factors.phosphorus
+      };
+      const recalculated = await api.simulate(project.id, influent, calibratedParameters);
+      setParameters(calibratedParameters);
+      setSimulation(recalculated);
+      setCalibrationState("success");
+      setCalibrationMessage(
+        `校准并复算完成：训练 ${result.training_sample_count} 条，验证 ${result.validation_sample_count} 条，目标函数改善 ${result.improvement_percent.toFixed(1)}%。`
+      );
+    } catch (error) {
+      setCalibrationState("error");
+      setCalibrationMessage(error instanceof Error ? error.message : "校准失败。");
+    }
+  };
   return (
     <div className="page">
       <PageHeading eyebrow="03 / 模型计算" title="仿真结果" description="查看稳态模型预测、污染物去除效果及出水达标情况。"
-        action={<div className="heading-actions"><button className="button secondary"><SlidersHorizontal size={17} /> 校准模型</button><button className="button primary"><Play size={17} fill="currentColor" /> 重新计算</button></div>} />
+        action={<div className="heading-actions"><button className="button secondary" onClick={() => setCalibrationOpen((open) => !open)}><SlidersHorizontal size={17} /> 校准模型</button><button className="button primary" onClick={() => navigate("input")}><Play size={17} fill="currentColor" /> 重新计算</button></div>} />
       <div className="run-summary">
-        <div><span className="success-pulse" /><p><strong>计算成功</strong><small>运行耗时 0.82 s · 2026-07-27 14:32</small></p></div>
-        <span>模型版本 <b>Steady-state v0.1</b></span>
+        <div><span className="success-pulse" /><p><strong>真实模型计算完成</strong><small>{new Date(simulation.created_at).toLocaleString("zh-CN")} · 仿真编号 {simulation.simulation_id.slice(0, 8)}</small></p></div>
+        <span>计算引擎 <b>{simulation.engine}</b></span>
       </div>
       <div className="result-metrics">
-        <div><Gauge size={20} /><span>综合达标率</span><strong>40%</strong><small>2 / 5 项达标</small></div>
-        <div><Droplets size={20} /><span>预测处理水量</span><strong>5,000</strong><small>m³/d</small></div>
-        <div><Activity size={20} /><span>运行能耗</span><strong>360</strong><small>kWh/d</small></div>
-        <div><ClipboardCheck size={20} /><span>干污泥产量</span><strong>810</strong><small>kg/d</small></div>
+        <div><Gauge size={20} /><span>综合达标率</span><strong>{passCount * 20}%</strong><small>{passCount} / 5 项达标</small></div>
+        <div><Droplets size={20} /><span>预测处理水量</span><strong>{influent.flow_m3_d.toLocaleString()}</strong><small>m³/d</small></div>
+        <div><Activity size={20} /><span>运行能耗</span><strong>{simulation.energy_kwh_d.toLocaleString()}</strong><small>kWh/d</small></div>
+        <div><ClipboardCheck size={20} /><span>干污泥产量</span><strong>{simulation.sludge_kg_d.toLocaleString()}</strong><small>kg/d</small></div>
       </div>
       <section className="result-section">
         <div className="section-title"><div><h2>进出水对比</h2><p>预测出水与当前排放限值对照</p></div><div className="legend"><span className="inlet-key" />进水 <span className="outlet-key" />预测出水</div></div>
@@ -554,20 +743,70 @@ function ResultPage({ navigate }: { navigate: (page: PageId) => void }) {
           ))}
         </div>
       </section>
-      <div className="result-note"><span>!</span><p><strong>校准建议</strong>TN、TP 和 TSS 预测出水超过限值，建议结合实测出水数据执行参数校准后重新计算。</p><button className="text-button" onClick={() => navigate("report")}>查看评估报告 <ArrowRight size={15} /></button></div>
+      <section className={`balance-panel ${simulation.mass_balance.passed ? "passed" : "failed"}`}>
+        <div><strong>质量守恒检查</strong><span>{simulation.mass_balance.passed ? "通过" : "未通过"}</span></div>
+        <p>水力误差 {simulation.mass_balance.hydraulic_relative_error.toExponential(2)} · 化学需氧量回收 {Math.round(simulation.mass_balance.cod_recovery * 100)}% · 总氮回收 {Math.round(simulation.mass_balance.nitrogen_recovery * 100)}% · {simulation.convergence_reached ? "达到稳态判定" : "尚未达到稳态判定"}</p>
+      </section>
+      {calibrationOpen && (
+        <section className="form-section calibration-panel">
+          <div className="section-title"><div><h2>实测出水校准</h2><p>同一污水厂按日期排序，最新时段自动作为独立验证集</p></div><span>{calibrationSamples.length} 条样本</span></div>
+          <label className="field"><span>污水厂分组</span><input value={groupId} onChange={(event) => setGroupId(event.target.value)} /></label>
+          <div className="indicator-grid">
+            {[
+              ["化学需氧量", "cod_mg_l"],
+              ["氨氮", "nh4_n_mg_l"],
+              ["总氮", "tn_mg_l"],
+              ["总磷", "tp_mg_l"],
+              ["悬浮物", "tss_mg_l"]
+            ].map(([label, key]) => (
+              <label className="indicator-field" key={key}><span>实测{label}</span><div><input value={measured[key as keyof typeof measured]} onChange={(event) => setMeasured((current) => ({ ...current, [key]: event.target.value }))} /><b>mg/L</b></div></label>
+            ))}
+          </div>
+          <div className="calibration-actions"><button className="button secondary" onClick={addCalibrationSample}><Plus size={16} /> 加入当前样本</button><button className="button primary" onClick={runCalibration} disabled={calibrationState === "running"}><SlidersHorizontal size={16} /> {calibrationState === "running" ? "校准中..." : "执行分组校准"}</button></div>
+          {calibrationMessage && <p className={calibrationState === "error" ? "form-message error" : "form-message"}>{calibrationMessage}</p>}
+        </section>
+      )}
+      <div className="result-note"><span>!</span><p><strong>模型提示</strong>{simulation.warnings[0] ?? "计算已完成，建议使用独立时段实测数据复核。"}</p><button className="text-button" onClick={() => navigate("report")}>查看评估报告 <ArrowRight size={15} /></button></div>
     </div>
   );
 }
 
 function ReportPage() {
-  const [format, setFormat] = useState("pdf");
+  const { project, simulation } = useWorkflow();
+  const [format, setFormat] = useState<"pdf" | "excel">("pdf");
+  const [reportName, setReportName] = useState("深水海纳示范污水厂工艺建模评估报告");
+  const [reportState, setReportState] = useState<"idle" | "running" | "error" | "success">("idle");
+  const [reportMessage, setReportMessage] = useState("");
+  const generateReport = async () => {
+    if (!project || !simulation) {
+      setReportState("error");
+      setReportMessage("请先保存项目并完成一次真实仿真。");
+      return;
+    }
+    setReportState("running");
+    setReportMessage("正在生成报告...");
+    try {
+      const result = await api.createReport(project.id, simulation.simulation_id, format, reportName);
+      const anchor = document.createElement("a");
+      anchor.href = apiUrl(result.download_url);
+      anchor.download = result.filename;
+      document.body.appendChild(anchor);
+      anchor.click();
+      anchor.remove();
+      setReportState("success");
+      setReportMessage(`报告已生成：${result.filename}`);
+    } catch (error) {
+      setReportState("error");
+      setReportMessage(error instanceof Error ? error.message : "报告生成失败。");
+    }
+  };
   return (
     <div className="page">
       <PageHeading eyebrow="04 / 成果输出" title="报告导出" description="整理项目参数、仿真结果和评估结论，生成标准化成果文件。" />
       <div className="report-layout">
         <section className="form-section">
           <div className="section-title"><div><h2>报告配置</h2><p>选择报告内容与输出格式</p></div></div>
-          <label className="field"><span>报告名称</span><input defaultValue="深水海纳示范污水厂工艺建模评估报告" /></label>
+          <label className="field"><span>报告名称</span><input value={reportName} onChange={(event) => setReportName(event.target.value)} /></label>
           <fieldset className="check-list">
             <legend>包含章节</legend>
             {["项目与工艺概况", "进水水质与运行参数", "稳态仿真结果", "污染物去除与达标分析", "模型校准指标", "结论与优化建议"].map((item) => (
@@ -579,7 +818,8 @@ function ReportPage() {
             <label className={format === "pdf" ? "selected" : ""}><input type="radio" name="format" value="pdf" checked={format === "pdf"} onChange={() => setFormat("pdf")} /><FileText size={22} /><span><strong>PDF 报告</strong><small>适合汇报与归档</small></span></label>
             <label className={format === "excel" ? "selected" : ""}><input type="radio" name="format" value="excel" checked={format === "excel"} onChange={() => setFormat("excel")} /><FileSpreadsheet size={22} /><span><strong>Excel 数据</strong><small>适合复核与二次分析</small></span></label>
           </fieldset>
-          <button className="button primary full-button"><FileDown size={18} /> 生成并下载{format === "pdf" ? " PDF 报告" : " Excel 数据"}</button>
+          <button className="button primary full-button" onClick={generateReport} disabled={reportState === "running"}><FileDown size={18} /> {reportState === "running" ? "正在生成..." : `生成并下载${format === "pdf" ? " PDF 报告" : " Excel 数据"}`}</button>
+          {reportMessage && <p className={reportState === "error" ? "form-message error" : "form-message"}>{reportMessage}</p>}
         </section>
         <aside className="report-preview">
           <div className="preview-toolbar"><span>报告预览</span><small>A4 · 共 12 页</small></div>
@@ -588,9 +828,9 @@ function ReportPage() {
             <span>QSDsan 标准工作流</span>
             <h2>污水工艺流程<br />建模评估报告</h2>
             <div className="paper-line" />
-            <strong>深水海纳示范污水厂</strong>
-            <p>AAO 工艺 · 稳态仿真模型</p>
-            <footer><span>编制日期</span><b>2026 年 7 月</b></footer>
+            <strong>{project?.plant_name ?? "尚未关联项目"}</strong>
+            <p>{project?.process_type ?? "待选择"} 工艺 · {simulation?.model_id ?? "待计算"} 动态模型</p>
+            <footer><span>编制日期</span><b>{new Date().toLocaleDateString("zh-CN")}</b></footer>
           </div>
         </aside>
       </div>
@@ -601,12 +841,23 @@ function ReportPage() {
 export function App() {
   const [page, setPage] = useState<PageId>(readPage);
   const [menuOpen, setMenuOpen] = useState(false);
+  const [project, setProject] = useState<ProjectRecord | null>(() => {
+    const saved = localStorage.getItem("qinglan-project");
+    return saved ? JSON.parse(saved) as ProjectRecord : null;
+  });
+  const [influent, setInfluent] = useState<WaterQuality | null>(null);
+  const [parameters, setParameters] = useState<ProcessParameters | null>(null);
+  const [simulation, setSimulation] = useState<SimulationResult | null>(null);
+  const [calibrationSamples, setCalibrationSamples] = useState<CalibrationSample[]>([]);
 
   useEffect(() => {
     const onHashChange = () => setPage(readPage());
     window.addEventListener("hashchange", onHashChange);
     return () => window.removeEventListener("hashchange", onHashChange);
   }, []);
+  useEffect(() => {
+    if (project) localStorage.setItem("qinglan-project", JSON.stringify(project));
+  }, [project]);
 
   const currentLabel = useMemo(() => pages.find((item) => item.id === page)?.label, [page]);
   const navigate = (next: PageId) => {
@@ -621,6 +872,18 @@ export function App() {
   }
 
   return (
+    <WorkflowContext.Provider value={{
+      project,
+      setProject,
+      influent,
+      setInfluent,
+      parameters,
+      setParameters,
+      simulation,
+      setSimulation,
+      calibrationSamples,
+      setCalibrationSamples
+    }}>
     <main className="app-shell">
       <aside className={`sidebar ${menuOpen ? "open" : ""}`} aria-label="功能导航">
         <div className="brand"><AppIcon /><div><strong>清澜智评</strong><small>WATER PROCESS STUDIO</small></div></div>
@@ -635,8 +898,8 @@ export function App() {
         </nav>
         <div className="sidebar-project">
           <span>当前项目</span>
-          <strong>深水海纳示范污水厂</strong>
-          <small><span /> AAO · 稳态模型</small>
+          <strong>{project?.plant_name ?? "尚未创建项目"}</strong>
+          <small><span /> {project?.process_type ?? "待选择"} · 动态模型</small>
         </div>
         <footer><button><CircleHelp size={17} /> 使用帮助</button><span>v0.1.0 · MVP</span></footer>
       </aside>
@@ -654,5 +917,6 @@ export function App() {
         {page === "report" && <ReportPage />}
       </section>
     </main>
+    </WorkflowContext.Provider>
   );
 }

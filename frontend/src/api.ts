@@ -1,0 +1,190 @@
+export type ProjectRecord = {
+  id: string;
+  name: string;
+  plant_name: string;
+  process_type: string;
+  owner: string | null;
+  description: string | null;
+  created_at: string;
+};
+
+export type WaterQuality = {
+  flow_m3_d: number;
+  cod_mg_l: number;
+  bod_mg_l: number | null;
+  nh4_n_mg_l: number;
+  tn_mg_l: number;
+  tp_mg_l: number;
+  tss_mg_l: number;
+  ph: number;
+  temperature_c: number;
+};
+
+export type ProcessParameters = {
+  process_type: string;
+  model_type: "ASM1" | "ASM2d";
+  hrt_h: number;
+  srt_d: number;
+  internal_recycle_ratio: number;
+  sludge_recycle_ratio: number;
+  aeration_power_kw: number;
+  aerobic_do_mg_l: number;
+  alkalinity_mg_l_caco3: number;
+  simulation_days: number;
+  cod_kinetic_factor: number;
+  nitrification_kinetic_factor: number;
+  denitrification_kinetic_factor: number;
+  phosphorus_kinetic_factor: number;
+};
+
+export type SimulationResult = {
+  simulation_id: string;
+  created_at: string;
+  project_id: string;
+  model_id: string;
+  engine: string;
+  effluent: {
+    cod_mg_l: number;
+    nh4_n_mg_l: number;
+    tn_mg_l: number;
+    tp_mg_l: number;
+    tss_mg_l: number;
+  };
+  removal_rates: Record<string, number>;
+  energy_kwh_d: number;
+  sludge_kg_d: number;
+  compliance: Record<string, boolean>;
+  model_note: string;
+  mass_balance: {
+    passed: boolean;
+    hydraulic_relative_error: number;
+    cod_recovery: number;
+    nitrogen_recovery: number;
+    phosphorus_recovery: number | null;
+    notes: string[];
+  };
+  component_mapping: {
+    method: string;
+    concentrations_mg_l: Record<string, number>;
+    reconstructed: Record<string, number>;
+    relative_residuals: Record<string, number>;
+  };
+  convergence_reached: boolean;
+  simulation_days: number;
+  assumptions: string[];
+  warnings: string[];
+};
+
+export type CalibrationSample = {
+  group_id: string;
+  sample_time: string;
+  influent: WaterQuality;
+  measured: Partial<SimulationResult["effluent"]>;
+  parameters: ProcessParameters;
+};
+
+const baseUrl = (import.meta.env.VITE_API_BASE_URL as string | undefined)?.replace(/\/$/, "") ?? "";
+
+export function apiUrl(path: string): string {
+  return `${baseUrl}${path}`;
+}
+
+async function request<T>(path: string, init?: RequestInit): Promise<T> {
+  const response = await fetch(apiUrl(path), {
+    ...init,
+    headers: {
+      "Content-Type": "application/json",
+      ...(init?.headers ?? {})
+    }
+  });
+  if (!response.ok) {
+    const body = await response.json().catch(() => null);
+    const detail = typeof body?.detail === "string" ? body.detail : `接口返回 ${response.status}`;
+    throw new Error(detail);
+  }
+  return response.json() as Promise<T>;
+}
+
+export const api = {
+  createProject(payload: Omit<ProjectRecord, "id" | "created_at">) {
+    return request<ProjectRecord>("/api/projects", {
+      method: "POST",
+      body: JSON.stringify(payload)
+    });
+  },
+  createMeasurement(projectId: string, waterQuality: WaterQuality) {
+    return request("/api/measurements", {
+      method: "POST",
+      body: JSON.stringify({
+        project_id: projectId,
+        location: "influent",
+        water_quality: waterQuality
+      })
+    });
+  },
+  simulate(projectId: string, influent: WaterQuality, parameters: ProcessParameters) {
+    return request<SimulationResult>("/api/simulate", {
+      method: "POST",
+      body: JSON.stringify({ project_id: projectId, influent, parameters })
+    });
+  },
+  calibrate(projectId: string, samples: CalibrationSample[]) {
+    return request<{
+      factors: Record<string, number>;
+      training_sample_count: number;
+      validation_sample_count: number;
+      validation_objective: number | null;
+      improvement_percent: number;
+      warnings: string[];
+    }>("/api/calibrate/model", {
+      method: "POST",
+      body: JSON.stringify({
+        project_id: projectId,
+        samples,
+        max_iterations: 8,
+        validation_fraction: 0.2
+      })
+    });
+  },
+  async importCalibration(projectId: string, file: File) {
+    const form = new FormData();
+    form.append("project_id", projectId);
+    form.append("file", file);
+    const response = await fetch(apiUrl("/api/calibrate/import"), {
+      method: "POST",
+      body: form
+    });
+    if (!response.ok) {
+      const body = await response.json().catch(() => null);
+      throw new Error(typeof body?.detail === "string" ? body.detail : `接口返回 ${response.status}`);
+    }
+    return response.json() as Promise<{
+      imported_count: number;
+      skipped_count: number;
+      groups: string[];
+      samples: CalibrationSample[];
+      warnings: string[];
+    }>;
+  },
+  createReport(
+    projectId: string,
+    simulationId: string,
+    format: "pdf" | "excel",
+    reportName: string
+  ) {
+    return request<{
+      status: string;
+      filename: string;
+      download_url: string;
+      message: string;
+    }>("/api/reports", {
+      method: "POST",
+      body: JSON.stringify({
+        project_id: projectId,
+        simulation_id: simulationId,
+        report_format: format,
+        report_name: reportName
+      })
+    });
+  }
+};

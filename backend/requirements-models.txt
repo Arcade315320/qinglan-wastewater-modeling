@@ -1,8 +1,8 @@
 -r requirements.txt
 
-# QSDsan 1.5.3 currently needs the scientific stack on Python 3.12.
-# NumPy 2.x can break binary dependencies in older pandas/pyarrow builds.
+# QSDsan/EXPOsan 1.5.3 require the current scientific stack on Python 3.12.
 qsdsan==1.5.3
-numpy>=1.26,<2
-pandas>=2.2,<3
+exposan==1.5.3
+numpy>=2.3.5,<2.5
+pandas>=2.3,<3
 scipy>=1.15,<1.16

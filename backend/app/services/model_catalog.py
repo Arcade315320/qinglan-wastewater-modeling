@@ -6,7 +6,7 @@ MODEL_CATALOG = (
         id=ModelType.asm2d,
         name="Activated Sludge Model No. 2d",
         scope="Carbon oxidation, nitrification, denitrification and biological/chemical phosphorus removal.",
-        status="ready_screening",
+        status="ready_dynamic",
         suitable_processes=[
             ProcessType.aao,
             ProcessType.uct,
@@ -25,7 +25,7 @@ MODEL_CATALOG = (
         id=ModelType.asm1,
         name="Activated Sludge Model No. 1",
         scope="Carbon oxidation, nitrification and denitrification without biological phosphorus removal.",
-        status="ready_screening",
+        status="ready_dynamic",
         suitable_processes=[
             ProcessType.cas,
             ProcessType.ao,

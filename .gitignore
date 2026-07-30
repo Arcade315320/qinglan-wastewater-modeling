@@ -1,10 +1,9 @@
 backend/.venv/
-backend/.model-venv/
+backend/.venv-model/
+backend/generated_reports/
+backend/app/assets/*.ttf
 frontend/node_modules/
 frontend/dist/
+.runtime-cache/
 __pycache__/
-*.py[cod]
-.env
-.env.*
-!.env.example
-.DS_Store
+*.pyc

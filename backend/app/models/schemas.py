@@ -2,7 +2,7 @@ from datetime import datetime
 from enum import StrEnum
 from uuid import uuid4
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 class ProcessType(StrEnum):
@@ -57,6 +57,11 @@ class ProcessParameters(BaseModel):
     aerobic_do_mg_l: float = Field(default=2.0, ge=0, le=14)
     alkalinity_mg_l_caco3: float = Field(default=250, ge=0)
     clarifier_solids_capture: float = Field(default=0.98, ge=0, le=1)
+    cod_kinetic_factor: float = Field(default=1.0, ge=0.1, le=5.0)
+    nitrification_kinetic_factor: float = Field(default=1.0, ge=0.1, le=5.0)
+    denitrification_kinetic_factor: float = Field(default=1.0, ge=0.1, le=5.0)
+    phosphorus_kinetic_factor: float = Field(default=1.0, ge=0.1, le=5.0)
+    simulation_days: float = Field(default=50, ge=5, le=200)
 
 
 class ProjectCreate(BaseModel):
@@ -87,6 +92,7 @@ class SimulationRequest(BaseModel):
     project_id: str
     influent: WaterQuality
     parameters: ProcessParameters = Field(default_factory=ProcessParameters)
+    component_concentrations: dict[str, float] | None = None
 
 
 class EffluentPrediction(BaseModel):
@@ -105,7 +111,25 @@ class RemovalRates(BaseModel):
     tss: float
 
 
+class ComponentMappingResult(BaseModel):
+    method: str
+    concentrations_mg_l: dict[str, float]
+    reconstructed: dict[str, float]
+    relative_residuals: dict[str, float]
+
+
+class MassBalanceResult(BaseModel):
+    passed: bool
+    hydraulic_relative_error: float
+    cod_recovery: float
+    nitrogen_recovery: float
+    phosphorus_recovery: float | None = None
+    notes: list[str] = Field(default_factory=list)
+
+
 class SimulationResult(BaseModel):
+    simulation_id: str = Field(default_factory=lambda: str(uuid4()))
+    created_at: datetime = Field(default_factory=datetime.utcnow)
     project_id: str
     model_id: ModelType
     engine: str
@@ -115,6 +139,10 @@ class SimulationResult(BaseModel):
     sludge_kg_d: float
     compliance: dict[str, bool]
     model_note: str
+    component_mapping: ComponentMappingResult
+    mass_balance: MassBalanceResult
+    convergence_reached: bool
+    simulation_days: float
     assumptions: list[str] = Field(default_factory=list)
     warnings: list[str] = Field(default_factory=list)
 
@@ -153,6 +181,84 @@ class CalibrationResult(BaseModel):
     recommendation: str
 
 
+class PartialEffluentMeasurement(BaseModel):
+    cod_mg_l: float | None = Field(default=None, ge=0)
+    nh4_n_mg_l: float | None = Field(default=None, ge=0)
+    tn_mg_l: float | None = Field(default=None, ge=0)
+    tp_mg_l: float | None = Field(default=None, ge=0)
+    tss_mg_l: float | None = Field(default=None, ge=0)
+
+    @model_validator(mode="after")
+    def require_at_least_one_indicator(self):
+        calibratable = (
+            self.cod_mg_l,
+            self.nh4_n_mg_l,
+            self.tn_mg_l,
+            self.tp_mg_l,
+        )
+        if not any(value is not None for value in calibratable):
+            raise ValueError(
+                "At least one measured COD, NH4-N, TN or TP value is required"
+            )
+        return self
+
+
+class ModelCalibrationSample(BaseModel):
+    group_id: str = "default"
+    sample_time: datetime = Field(default_factory=datetime.utcnow)
+    influent: WaterQuality
+    measured: PartialEffluentMeasurement
+    parameters: ProcessParameters = Field(default_factory=ProcessParameters)
+
+
+class KineticFactors(BaseModel):
+    cod: float = 1.0
+    nitrification: float = 1.0
+    denitrification: float = 1.0
+    phosphorus: float = 1.0
+
+
+class IndicatorCalibrationMetrics(BaseModel):
+    sample_count: int
+    initial_mae: float
+    calibrated_mae: float
+    initial_rmse: float
+    calibrated_rmse: float
+    mean_bias: float
+
+
+class ModelCalibrationRequest(BaseModel):
+    project_id: str
+    samples: list[ModelCalibrationSample] = Field(min_length=2, max_length=500)
+    max_iterations: int = Field(default=20, ge=1, le=100)
+    validation_fraction: float = Field(default=0.2, ge=0, le=0.5)
+
+
+class ModelCalibrationResult(BaseModel):
+    project_id: str
+    sample_count: int
+    initial_objective: float
+    calibrated_objective: float
+    improvement_percent: float
+    factors: KineticFactors
+    indicator_metrics: dict[str, IndicatorCalibrationMetrics]
+    iterations: int
+    training_sample_count: int
+    validation_sample_count: int
+    validation_objective: float | None = None
+    recommendation: str
+    warnings: list[str] = Field(default_factory=list)
+
+
+class CalibrationImportResult(BaseModel):
+    project_id: str
+    imported_count: int
+    skipped_count: int
+    groups: list[str]
+    samples: list[ModelCalibrationSample]
+    warnings: list[str] = Field(default_factory=list)
+
+
 class ReportFormat(StrEnum):
     pdf = "pdf"
     excel = "excel"
@@ -162,6 +268,7 @@ class ReportRequest(BaseModel):
     project_id: str
     simulation_id: str | None = None
     report_format: ReportFormat = ReportFormat.pdf
+    report_name: str | None = None
 
 
 class ReportResult(BaseModel):
@@ -169,3 +276,5 @@ class ReportResult(BaseModel):
     status: str
     report_format: ReportFormat
     message: str
+    filename: str | None = None
+    download_url: str | None = None

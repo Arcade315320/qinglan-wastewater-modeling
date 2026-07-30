@@ -1,0 +1,9 @@
+services:
+  - type: web
+    name: qinglan-wastewater-api
+    runtime: docker
+    dockerfilePath: ./backend/Dockerfile
+    dockerContext: ./backend
+    healthCheckPath: /health
+    plan: free
+    autoDeploy: true

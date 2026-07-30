@@ -1,12 +1,16 @@
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, File, Form, HTTPException, UploadFile
+from fastapi.responses import FileResponse
 
 from app.models.schemas import (
     CalibrationRequest,
     CalibrationResult,
+    CalibrationImportResult,
     MeasurementCreate,
     MeasurementRecord,
     ModelEngineStatus,
     ModelInfo,
+    ModelCalibrationRequest,
+    ModelCalibrationResult,
     ProjectCreate,
     ProjectRecord,
     ReportRequest,
@@ -18,8 +22,9 @@ from app.services.model_catalog import list_models
 from app.services.project_service import project_store
 from app.services.qsdsan_adapter import get_engine_status
 from app.services.simulation_service import run_simulation
-from app.services.calibration_service import calculate_error_metrics
-from app.services.report_service import create_report_stub
+from app.services.spreadsheet_import_service import import_calibration_workbook
+from app.services.calibration_service import calculate_error_metrics, calibrate_model
+from app.services.report_service import REPORT_DIR, create_report as create_report_file
 
 router = APIRouter()
 
@@ -56,7 +61,7 @@ def simulate(payload: SimulationRequest) -> SimulationResult:
     if not project_store.exists(payload.project_id):
         raise HTTPException(status_code=404, detail="Project not found")
     try:
-        return run_simulation(payload)
+        return project_store.add_simulation(run_simulation(payload))
     except ValueError as error:
         raise HTTPException(status_code=422, detail=str(error)) from error
 
@@ -68,8 +73,60 @@ def calibrate(payload: CalibrationRequest) -> CalibrationResult:
     return calculate_error_metrics(payload)
 
 
+@router.post(
+    "/calibrate/model",
+    response_model=ModelCalibrationResult,
+    tags=["calibration"],
+)
+def calibrate_process_model(
+    payload: ModelCalibrationRequest,
+) -> ModelCalibrationResult:
+    if not project_store.exists(payload.project_id):
+        raise HTTPException(status_code=404, detail="Project not found")
+    try:
+        return calibrate_model(payload)
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+
+
+@router.post(
+    "/calibrate/import",
+    response_model=CalibrationImportResult,
+    tags=["calibration"],
+)
+async def import_calibration_data(
+    project_id: str = Form(...),
+    file: UploadFile = File(...),
+) -> CalibrationImportResult:
+    project = project_store.get_project(project_id)
+    if project is None:
+        raise HTTPException(status_code=404, detail="Project not found")
+    if not file.filename or not file.filename.lower().endswith(".xlsx"):
+        raise HTTPException(status_code=422, detail="Only .xlsx workbooks are supported")
+    try:
+        return import_calibration_workbook(project, await file.read())
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+
+
 @router.post("/reports", response_model=ReportResult, tags=["reports"])
 def create_report(payload: ReportRequest) -> ReportResult:
     if not project_store.exists(payload.project_id):
         raise HTTPException(status_code=404, detail="Project not found")
-    return create_report_stub(payload)
+    project = project_store.get_project(payload.project_id)
+    simulation = project_store.get_simulation(
+        payload.project_id, payload.simulation_id
+    )
+    if project is None:
+        raise HTTPException(status_code=404, detail="Project not found")
+    if simulation is None:
+        raise HTTPException(status_code=404, detail="Simulation result not found")
+    return create_report_file(payload, project, simulation)
+
+
+@router.get("/reports/files/{filename}", tags=["reports"])
+def download_report(filename: str) -> FileResponse:
+    path = (REPORT_DIR / filename).resolve()
+    if path.parent != REPORT_DIR.resolve() or not path.is_file():
+        raise HTTPException(status_code=404, detail="Report file not found")
+    return FileResponse(path, filename=path.name)
