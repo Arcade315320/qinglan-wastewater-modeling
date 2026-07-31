@@ -21,7 +21,7 @@ app = modal.App(APP_NAME)
 
 @app.function(
     image=image,
-    memory=2048,
+    memory=4096,
     cpu=2.0,
     timeout=300,
     scaledown_window=300,
@@ -53,7 +53,7 @@ def simulate(payload: dict, request: Request) -> dict:
         detail = completed.stderr.strip().splitlines()[-1] if completed.stderr else ""
         raise HTTPException(
             status_code=422,
-            detail=detail or "动态模型子进程计算失败。",
+            detail=detail or f"动态模型子进程异常退出，退出码为{completed.returncode}。",
         )
     try:
         return json.loads(completed.stdout)
