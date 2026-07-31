@@ -12,8 +12,9 @@
 模型元数据可由 `GET /api/models` 获取。`POST /api/simulate` 通过
 `parameters.model_type` 选择模型。
 
-`GET /api/models/engine` 会返回 FastAPI 当前 Python 进程能否导入 QSDsan、
-包版本及失败原因。只有 `available=true` 才能启用官方动态系统适配器。
+`GET /api/models/engine` 会返回当前服务能否使用 QSDsan。配置 Modal 远程
+计算端点后，Render 即使只有 512 MB 内存也会返回 `available=true`，动态
+计算由具备 2 GB 内存的 Modal 函数执行。
 
 ## ASM2d 对照结果
 
@@ -36,6 +37,9 @@ source .venv-model/bin/activate
 pip install -r requirements-models.txt
 python -c "import qsdsan; print(qsdsan.__version__)"
 ```
+
+Modal 镜像使用 `requirements-modal.txt`，其版本应与本地
+`requirements-models.txt` 保持一致。
 
 本机曾存在 QSDsan 1.5.3，但 Anaconda 基础环境的 NumPy 2.4.6 与已有
 pandas/pyarrow 二进制包不兼容。不要直接复用该基础环境；应按上述版本隔离。

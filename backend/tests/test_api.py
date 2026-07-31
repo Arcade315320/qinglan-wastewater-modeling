@@ -1,6 +1,6 @@
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from fastapi.testclient import TestClient
 
@@ -72,7 +72,7 @@ class ApiWorkflowTests(unittest.TestCase):
         self.assertEqual(project_response.status_code, 200)
         project_id = project_response.json()["id"]
         with patch(
-            "app.api.routes.run_simulation",
+            "app.api.routes.run_simulation_dispatch",
             return_value=fake_result(project_id),
         ):
             simulation_response = client.post(
@@ -111,6 +111,51 @@ class ApiWorkflowTests(unittest.TestCase):
             self.assertGreater(len(download.content), 1000)
             path = Path(__file__).resolve().parents[1] / "generated_reports" / body["filename"]
             path.unlink(missing_ok=True)
+
+    def test_remote_simulation_gateway(self) -> None:
+        from app.models.schemas import SimulationRequest
+        from app.services.simulation_gateway import run_simulation_dispatch
+
+        payload = SimulationRequest.model_validate(
+            {
+                "project_id": "remote-test",
+                "influent": {
+                    "flow_m3_d": 5000,
+                    "cod_mg_l": 300,
+                    "nh4_n_mg_l": 35,
+                    "tn_mg_l": 48,
+                    "tp_mg_l": 5,
+                    "tss_mg_l": 200,
+                    "ph": 7.2,
+                    "temperature_c": 20,
+                },
+            }
+        )
+        response = Mock()
+        response.json.return_value = fake_result(payload.project_id).model_dump(
+            mode="json"
+        )
+        response.raise_for_status.return_value = None
+        with (
+            patch(
+                "app.services.simulation_gateway.settings.modal_simulation_url",
+                "https://example.modal.run",
+            ),
+            patch(
+                "app.services.simulation_gateway.settings.modal_auth_token",
+                "test-token",
+            ),
+            patch(
+                "app.services.simulation_gateway.httpx.post",
+                return_value=response,
+            ) as post,
+        ):
+            result = run_simulation_dispatch(payload)
+        self.assertEqual(result.project_id, payload.project_id)
+        self.assertEqual(
+            post.call_args.kwargs["headers"]["Authorization"],
+            "Bearer test-token",
+        )
 
 
 if __name__ == "__main__":

@@ -20,8 +20,10 @@ from app.models.schemas import (
 )
 from app.services.model_catalog import list_models
 from app.services.project_service import project_store
-from app.services.qsdsan_adapter import get_engine_status
-from app.services.simulation_service import run_simulation
+from app.services.simulation_gateway import (
+    get_simulation_engine_status,
+    run_simulation_dispatch,
+)
 from app.services.spreadsheet_import_service import import_calibration_workbook
 from app.services.calibration_service import calculate_error_metrics, calibrate_model
 from app.services.report_service import REPORT_DIR, create_report as create_report_file
@@ -36,7 +38,7 @@ def get_models() -> list[ModelInfo]:
 
 @router.get("/models/engine", response_model=ModelEngineStatus, tags=["models"])
 def model_engine_status() -> ModelEngineStatus:
-    return get_engine_status()
+    return get_simulation_engine_status()
 
 
 @router.post("/projects", response_model=ProjectRecord, tags=["projects"])
@@ -61,7 +63,7 @@ def simulate(payload: SimulationRequest) -> SimulationResult:
     if not project_store.exists(payload.project_id):
         raise HTTPException(status_code=404, detail="Project not found")
     try:
-        return project_store.add_simulation(run_simulation(payload))
+        return project_store.add_simulation(run_simulation_dispatch(payload))
     except ValueError as error:
         raise HTTPException(status_code=422, detail=str(error)) from error
 

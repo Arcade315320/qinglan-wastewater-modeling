@@ -5,6 +5,9 @@ from pydantic_settings import BaseSettings
 class Settings(BaseSettings):
     app_name: str = "Wastewater Process Modeling API"
     app_version: str = "0.1.0"
+    modal_simulation_url: str | None = None
+    modal_auth_token: str | None = None
+    simulation_timeout_seconds: float = 145.0
     cors_origins: list[str] = Field(
         default_factory=lambda: [
             "http://localhost:5173",

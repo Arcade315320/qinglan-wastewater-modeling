@@ -77,6 +77,25 @@ npm run dev
 `frontend`。先用根目录 `render.yaml` 部署后端，再在 GitHub 仓库变量中将
 `API_BASE_URL` 设置为后端公开地址。前端不再生成本地假结果。
 
+## 免费线上计算
+
+线上采用两层部署：Render 免费实例处理项目、校准和报告接口，Modal 免费
+账户提供 2 GB 内存运行完整 QSDsan 动态模型。部署计算端点：
+
+```bash
+cd backend
+python -m modal secret create qinglan-simulation-auth \
+  SIMULATION_AUTH_TOKEN=自行生成的高强度随机值
+python -m modal deploy modal_app.py
+```
+
+随后在 Render 中配置：
+
+- `MODAL_SIMULATION_URL`：Modal 部署命令返回的函数地址
+- `MODAL_AUTH_TOKEN`：与 Modal 密钥中的随机值一致
+
+访问密钥不得提交到 Git 仓库。
+
 ## 第 1 天完成状态
 
 - 已搭建后端 FastAPI 基础工程
