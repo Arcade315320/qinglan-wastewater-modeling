@@ -1,5 +1,8 @@
 import hmac
+import json
 import os
+import subprocess
+import sys
 
 import modal
 from fastapi import HTTPException, Request
@@ -32,16 +35,30 @@ def simulate(payload: dict, request: Request) -> dict:
     if not supplied or not hmac.compare_digest(supplied, expected):
         raise HTTPException(status_code=401, detail="访问密钥无效。")
 
-    from app.models.schemas import SimulationRequest
-    from app.services.simulation_service import run_simulation
-
     try:
-        simulation_request = SimulationRequest.model_validate(payload)
-        if simulation_request.parameters.simulation_days > 50:
-            raise ValueError(
-                "线上同步动态仿真目前最多支持50天；更长时段需要改用异步计算任务。"
-            )
-        result = run_simulation(simulation_request)
-    except ValueError as error:
-        raise HTTPException(status_code=422, detail=str(error)) from error
-    return result.model_dump(mode="json")
+        completed = subprocess.run(
+            [sys.executable, "-m", "app.services.simulation_worker"],
+            input=json.dumps(payload, ensure_ascii=False),
+            text=True,
+            capture_output=True,
+            timeout=285,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as error:
+        raise HTTPException(
+            status_code=422,
+            detail="动态模型计算超过285秒，请缩短积分时长或改用异步任务。",
+        ) from error
+    if completed.returncode != 0:
+        detail = completed.stderr.strip().splitlines()[-1] if completed.stderr else ""
+        raise HTTPException(
+            status_code=422,
+            detail=detail or "动态模型子进程计算失败。",
+        )
+    try:
+        return json.loads(completed.stdout)
+    except json.JSONDecodeError as error:
+        raise HTTPException(
+            status_code=422,
+            detail="动态模型返回结果无法解析。",
+        ) from error
