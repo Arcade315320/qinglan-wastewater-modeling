@@ -306,6 +306,9 @@ def run_simulation(payload: SimulationRequest) -> SimulationResult:
         warnings,
     ) = run_dynamic_system(payload)
     influent = payload.influent
+    reactor_model = (
+        "PFR" if payload.parameters.model_type == ModelType.asm2d else "CSTR"
+    )
     removal = RemovalRates(
         cod=_removal(influent.cod_mg_l, effluent.cod_mg_l),
         nh4_n=_removal(influent.nh4_n_mg_l, effluent.nh4_n_mg_l),
@@ -316,7 +319,10 @@ def run_simulation(payload: SimulationRequest) -> SimulationResult:
     return SimulationResult(
         project_id=payload.project_id,
         model_id=payload.parameters.model_type,
-        engine=f"QSDsan/EXPOsan {payload.parameters.model_type.value} dynamic CSTR system",
+        engine=(
+            f"QSDsan/EXPOsan {payload.parameters.model_type.value} "
+            f"dynamic {reactor_model} system"
+        ),
         effluent=effluent,
         removal_rates=removal,
         energy_kwh_d=energy_kwh_d,
@@ -329,7 +335,7 @@ def run_simulation(payload: SimulationRequest) -> SimulationResult:
             "tss": effluent.tss_mg_l <= 10,
         },
         model_note=(
-            "由QSDsan动态反应器、内回流、污泥回流和十层二沉池组成；"
+            "由QSDsan分段动态反应器、内回流、污泥回流和十层二沉池组成；"
             "启用强化处理时叠加后置反硝化、化学除磷和三级过滤工程计算；"
             "自动组分化结果必须结合实测组分和独立时段校准复核。"
         ),

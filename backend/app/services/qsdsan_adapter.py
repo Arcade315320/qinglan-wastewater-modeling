@@ -1,3 +1,4 @@
+import math
 import platform
 from contextlib import contextmanager
 from importlib.metadata import PackageNotFoundError, version
@@ -513,7 +514,9 @@ def run_dynamic_system(
         )
         system = bsm.create_system(
             suspended_growth_model=params.model_type.value,
-            reactor_model="CSTR",
+            reactor_model=(
+                "PFR" if params.model_type == ModelType.asm2d else "CSTR"
+            ),
             inf_kwargs={
                 "concentrations": components,
                 "units": ("m3/d", "mg/L"),
@@ -538,6 +541,11 @@ def run_dynamic_system(
         integration_converged = _integration_converged(
             system, params.simulation_days
         )
+        solution = getattr(getattr(system, "scope", None), "sol", None)
+        if solution is None or not solution.success:
+            raise ValueError(
+                "动态积分未得到有效解，请检查模型初始条件和进水组分。"
+            )
         effluent = system.flowsheet.stream.effluent
         was = system.flowsheet.stream.WAS
 
@@ -550,6 +558,10 @@ def run_dynamic_system(
         else:
             ammonium = _stream_concentration(effluent, "S_NH4")
             tp = float(_safe_composite(effluent, "P") or 0.0)
+        if not all(math.isfinite(value) for value in (cod, tss, tn, ammonium, tp)):
+            raise ValueError(
+                "动态积分产生非有限结果，请检查模型初始条件和进水组分。"
+            )
 
         biological_prediction = EffluentPrediction(
             cod_mg_l=round(max(0.0, cod), 3),

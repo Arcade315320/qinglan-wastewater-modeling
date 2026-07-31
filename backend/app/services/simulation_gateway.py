@@ -34,7 +34,7 @@ def run_simulation_dispatch(payload: SimulationRequest) -> SimulationResult:
         return SimulationResult.model_validate(response.json())
     except httpx.TimeoutException as error:
         raise ValueError(
-            "远程动态仿真超过等待时间，请缩短仿真天数后重试。"
+            "远程动态仿真超过等待时间，请稍后重试或缩短仿真天数。"
         ) from error
     except httpx.HTTPStatusError as error:
         try:

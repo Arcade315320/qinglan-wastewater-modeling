@@ -573,7 +573,7 @@ function InputPage({ navigate }: { navigate: (page: PageId) => void }) {
   };
   const runSimulation = async () => {
     setRunState("running");
-    setMessage("正在执行动态积分，通常需要数秒至一分钟。");
+    setMessage("正在执行动态积分，复杂工况通常需要一至五分钟，请保持页面打开。");
     try {
       if (!project) throw new Error("请先在项目概览中保存项目。");
       const { waterQuality, processParameters } = buildPayload();

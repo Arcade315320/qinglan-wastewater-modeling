@@ -19,7 +19,8 @@ app = modal.App(APP_NAME)
 @app.function(
     image=image,
     memory=2048,
-    timeout=145,
+    cpu=2.0,
+    timeout=300,
     scaledown_window=300,
     secrets=[modal.Secret.from_name(SECRET_NAME)],
 )

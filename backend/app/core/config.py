@@ -7,7 +7,7 @@ class Settings(BaseSettings):
     app_version: str = "0.1.0"
     modal_simulation_url: str | None = None
     modal_auth_token: str | None = None
-    simulation_timeout_seconds: float = 145.0
+    simulation_timeout_seconds: float = 290.0
     cors_origins: list[str] = Field(
         default_factory=lambda: [
             "http://localhost:5173",
