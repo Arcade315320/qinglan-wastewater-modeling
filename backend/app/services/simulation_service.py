@@ -41,6 +41,12 @@ P_REMOVAL_PROCESSES = {
     ProcessType.ifas,
 }
 
+DYNAMIC_SUPPORTED_PROCESSES = {
+    ProcessType.cas,
+    ProcessType.ao,
+    ProcessType.aao,
+}
+
 
 def _clip(value: float, lower: float = 0.0, upper: float = 1.0) -> float:
     return max(lower, min(upper, value))
@@ -88,6 +94,12 @@ def _validate_model(payload: SimulationRequest) -> None:
         raise ValueError(
             "ADM1 requires anaerobic substrate fractionation, VFA and gas-phase inputs. "
             "Use ASM2d for the aerobic section of UASB+A/O until the anaerobic input form is added."
+        )
+    if process not in DYNAMIC_SUPPORTED_PROCESSES:
+        raise ValueError(
+            f"当前动态系统尚未建立{process.value}专用单元、回流和固液分离拓扑，"
+            "不能将连续流活性污泥近似结果作为该工艺的准确结果。"
+            "目前可运行CAS、AO和AAO；其他工艺需先完成专用QSDsan系统。"
         )
     if model == ModelType.asm1 and process in P_REMOVAL_PROCESSES:
         return
@@ -297,6 +309,7 @@ def run_simulation(payload: SimulationRequest) -> SimulationResult:
     _validate_model(payload)
     (
         effluent,
+        biological_effluent,
         mapping,
         mass_balance,
         energy_kwh_d,
@@ -324,6 +337,12 @@ def run_simulation(payload: SimulationRequest) -> SimulationResult:
             f"dynamic {reactor_model} system"
         ),
         effluent=effluent,
+        biological_effluent=biological_effluent,
+        advanced_treatment_applied=(
+            payload.parameters.external_carbon_dose_mg_l > 0
+            or payload.parameters.ferric_chloride_dose_mg_l > 0
+            or payload.parameters.tertiary_filter_solids_capture > 0
+        ),
         removal_rates=removal,
         energy_kwh_d=energy_kwh_d,
         sludge_kg_d=sludge_kg_d,

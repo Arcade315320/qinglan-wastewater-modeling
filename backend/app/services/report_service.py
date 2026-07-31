@@ -99,13 +99,19 @@ def _create_pdf(
             f"项目：{project.name}<br/>污水厂：{project.plant_name}<br/>"
             f"主体工艺：{project.process_type.value}<br/>"
             f"计算引擎：{simulation.engine}<br/>"
+            f"结果范围：{'生化段加强化处理最终出水' if simulation.advanced_treatment_applied else '基础生化段与二沉池出水'}<br/>"
             f"计算时间：{simulation.created_at:%Y-%m-%d %H:%M}",
             body_style,
         ),
         Paragraph("二、出水预测与达标结果", heading_style),
     ]
-    rows = [["指标", "预测值（毫克/升）", "去除率", "是否达标"]]
+    rows = [["指标", "生化段出水", "最终出水", "去除率", "是否达标"]]
     effluent = simulation.effluent.model_dump()
+    biological = (
+        simulation.biological_effluent.model_dump()
+        if simulation.biological_effluent is not None
+        else effluent
+    )
     removals = simulation.removal_rates.model_dump()
     compliance = simulation.compliance
     indicator_keys = [
@@ -119,12 +125,16 @@ def _create_pdf(
         rows.append(
             [
                 INDICATOR_LABELS[effluent_key],
+                f"{biological[effluent_key]:.3f}",
                 f"{effluent[effluent_key]:.3f}",
                 f"{removals[result_key] * 100:.1f}%",
                 "达标" if compliance[result_key] else "超标",
             ]
         )
-    table = Table(rows, colWidths=[45 * mm, 45 * mm, 35 * mm, 28 * mm])
+    table = Table(
+        rows,
+        colWidths=[36 * mm, 34 * mm, 34 * mm, 27 * mm, 24 * mm],
+    )
     table.setStyle(
         TableStyle(
             [
@@ -179,12 +189,23 @@ def _create_excel(
         ("污水厂名称", project.plant_name),
         ("主体工艺", project.process_type.value),
         ("计算引擎", simulation.engine),
+        (
+            "结果范围",
+            "生化段加强化处理最终出水"
+            if simulation.advanced_treatment_applied
+            else "基础生化段与二沉池出水",
+        ),
         ("仿真编号", simulation.simulation_id),
         ("计算时间", simulation.created_at.strftime("%Y-%m-%d %H:%M:%S")),
         (),
-        ("指标", "预测值（毫克/升）", "去除率", "达标情况"),
+        ("指标", "生化段出水", "最终出水", "去除率", "达标情况"),
     ]
     effluent = simulation.effluent.model_dump()
+    biological = (
+        simulation.biological_effluent.model_dump()
+        if simulation.biological_effluent is not None
+        else effluent
+    )
     removals = simulation.removal_rates.model_dump()
     for effluent_key, result_key in (
         ("cod_mg_l", "cod"),
@@ -196,6 +217,7 @@ def _create_excel(
         rows.append(
             (
                 INDICATOR_LABELS[effluent_key],
+                biological[effluent_key],
                 effluent[effluent_key],
                 removals[result_key],
                 "达标" if simulation.compliance[result_key] else "超标",
@@ -203,12 +225,13 @@ def _create_excel(
         )
     for row in rows:
         summary.append(row)
-    summary.freeze_panes = "A9"
+    summary.freeze_panes = "A10"
     summary.column_dimensions["A"].width = 24
     summary.column_dimensions["B"].width = 42
     summary.column_dimensions["C"].width = 16
     summary.column_dimensions["D"].width = 16
-    for cell in summary[8]:
+    summary.column_dimensions["E"].width = 16
+    for cell in summary[9]:
         cell.font = Font(bold=True, color="174F43")
         cell.fill = PatternFill("solid", fgColor="DCEFE8")
 

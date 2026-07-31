@@ -53,6 +53,14 @@ export type SimulationResult = {
     tp_mg_l: number;
     tss_mg_l: number;
   };
+  biological_effluent: {
+    cod_mg_l: number;
+    nh4_n_mg_l: number;
+    tn_mg_l: number;
+    tp_mg_l: number;
+    tss_mg_l: number;
+  } | null;
+  advanced_treatment_applied: boolean;
   removal_rates: Record<string, number>;
   energy_kwh_d: number;
   sludge_kg_d: number;

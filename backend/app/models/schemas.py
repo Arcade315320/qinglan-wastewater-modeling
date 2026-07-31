@@ -145,6 +145,8 @@ class SimulationResult(BaseModel):
     model_id: ModelType
     engine: str
     effluent: EffluentPrediction
+    biological_effluent: EffluentPrediction | None = None
+    advanced_treatment_applied: bool = False
     removal_rates: RemovalRates
     energy_kwh_d: float
     sludge_kg_d: float

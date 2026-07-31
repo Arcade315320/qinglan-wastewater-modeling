@@ -7,6 +7,7 @@ from app.models.schemas import (
     EffluentPrediction,
     ModelCalibrationRequest,
     ModelType,
+    ProcessType,
     SimulationRequest,
 )
 from app.services.calibration_service import calibrate_model
@@ -19,6 +20,7 @@ from app.services.qsdsan_adapter import (
     get_engine_status,
 )
 from app.services.simulation_service import run_simulation
+from app.services.simulation_service import _validate_model
 
 
 def bsm1_payload() -> SimulationRequest:
@@ -227,6 +229,56 @@ class AdvancedTreatmentTests(unittest.TestCase):
         self.assertGreater(sludge, 0)
         self.assertTrue(assumptions)
         self.assertTrue(warnings)
+
+    def test_result_exposes_biological_and_final_effluent(self) -> None:
+        payload = bsm1_payload()
+        payload.parameters.external_carbon_dose_mg_l = 8
+        with patch(
+            "app.services.simulation_service.run_dynamic_system",
+            return_value=(
+                EffluentPrediction(
+                    cod_mg_l=40, nh4_n_mg_l=2, tn_mg_l=12,
+                    tp_mg_l=0.4, tss_mg_l=8,
+                ),
+                EffluentPrediction(
+                    cod_mg_l=45, nh4_n_mg_l=2, tn_mg_l=14,
+                    tp_mg_l=0.8, tss_mg_l=12,
+                ),
+                self._mapping(),
+                self._balance(),
+                100,
+                50,
+                False,
+                [],
+                [],
+            ),
+        ):
+            result = run_simulation(payload)
+        self.assertTrue(result.advanced_treatment_applied)
+        self.assertEqual(result.biological_effluent.tn_mg_l, 14)
+        self.assertEqual(result.effluent.tn_mg_l, 12)
+
+    @staticmethod
+    def _mapping():
+        from app.models.schemas import ComponentMappingResult
+        return ComponentMappingResult(
+            method="测试", concentrations_mg_l={},
+            reconstructed={}, relative_residuals={},
+        )
+
+    @staticmethod
+    def _balance():
+        from app.models.schemas import MassBalanceResult
+        return MassBalanceResult(
+            passed=True, hydraulic_relative_error=0,
+            cod_recovery=0.5, nitrogen_recovery=0.5,
+        )
+
+    def test_unsupported_process_topology_is_rejected(self) -> None:
+        payload = bsm1_payload()
+        payload.parameters.process_type = ProcessType.mbr
+        with self.assertRaisesRegex(ValueError, "尚未建立MBR专用"):
+            _validate_model(payload)
 
 class MemoryRequirementTests(unittest.TestCase):
     def test_low_memory_instance_is_rejected_before_model_import(self) -> None:

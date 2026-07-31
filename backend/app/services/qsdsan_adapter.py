@@ -490,6 +490,7 @@ def run_dynamic_system(
     payload: SimulationRequest,
 ) -> tuple[
     EffluentPrediction,
+    EffluentPrediction,
     ComponentMappingResult,
     MassBalanceResult,
     float,
@@ -671,6 +672,19 @@ def run_dynamic_system(
             and integration_converged
         )
         warnings = []
+        specific_aeration_energy = (
+            params.aeration_power_kw * 24 / max(water.flow_m3_d, 1e-9)
+        )
+        warnings.append(
+            "好氧池溶解氧当前作为运行目标记录；QSDsan动态反应器仍采用基准传氧系数，"
+            "尚未由该数值反算现场传氧系数。"
+        )
+        if specific_aeration_energy < 0.05:
+            warnings.append(
+                f"录入曝气功率对应单位水量能耗仅{specific_aeration_energy:.3f}"
+                "千瓦时/立方米，明显偏低；该参数只用于能耗核算，不改变生化动力学，"
+                "请用鼓风机实测总功率和运行时长复核。"
+            )
         if not mapping_ok:
             warnings.append("总量到模型组分的重构偏差超过15%，请补充实测组分数据。")
         if not recovery_ok:
@@ -679,10 +693,14 @@ def run_dynamic_system(
             else:
                 warnings.append("模型尚未达到稳态，表观物质回收暂不参与守恒判定。")
         if not convergence_reached:
-            warnings.append("动态积分时长不足或水力闭合未通过，尚不能判定为稳态。")
+            if hydraulic_error <= 1e-5:
+                warnings.append("水力闭合已通过，但动态积分时长不足，尚不能判定为稳态。")
+            else:
+                warnings.append("水力闭合未通过，尚不能判定为稳态。")
         warnings.extend(advanced_warnings)
         return (
             prediction,
+            biological_prediction,
             mapping,
             balance,
             round(energy_kwh_d, 3),

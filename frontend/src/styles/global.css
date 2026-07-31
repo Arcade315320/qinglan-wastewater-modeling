@@ -205,6 +205,10 @@ button { cursor: pointer; }
 .indicator-field input:disabled { background: #f1f4f3; color: #8b9995; cursor: not-allowed; }
 .treatment-note { margin: 15px 0 0; color: #667772; font-size: 13px; line-height: 1.6; }
 .treatment-result-banner { margin-top: 20px; }
+.untreated-warning { border-left-color: #c5891d; background: #fbf4e5; color: #775b22; }
+.untreated-warning button { white-space: nowrap; color: #8a6113; cursor: pointer; }
+.treatment-stage-summary { display: grid; grid-template-columns: auto 1fr 1fr; align-items: center; gap: 16px; margin-top: 12px; border: 1px solid #d5e5df; padding: 12px 14px; background: #f7faf9; color: #5c7069; font-size: 11px; }
+.treatment-stage-summary strong { color: #236c59; }
 .recovery-detail { margin-top: 7px !important; color: #667772 !important; font-size: 13px; }
 .indicator-field { display: grid; gap: 6px; }
 .indicator-field > span { color: #52625d; font-size: 11px; font-weight: 700; }
@@ -371,6 +375,7 @@ button { cursor: pointer; }
   .result-note { grid-template-columns: 24px 1fr; }
   .result-note .text-button { grid-column: 2; justify-self: start; }
   .run-summary { align-items: flex-start; flex-direction: column; }
+  .treatment-stage-summary { grid-template-columns: 1fr; gap: 7px; }
   .format-picker { grid-template-columns: 1fr; }
   .format-picker legend { grid-column: 1; }
   .page-footer-actions { align-items: stretch; flex-direction: column; }

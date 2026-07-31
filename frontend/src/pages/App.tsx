@@ -91,6 +91,8 @@ type ProcessDefinition = {
   features: string[];
 };
 
+const dynamicSupportedProcesses = new Set(["CAS", "AO", "AAO"]);
+
 const processCatalog: ProcessDefinition[] = [
   {
     id: "CAS",
@@ -381,7 +383,7 @@ function ProjectPage() {
       </section>
 
       <section className="form-section">
-        <div className="section-title"><div><h2>工艺路线</h2><p>选择主体工艺并确认模型中的处理单元顺序</p></div><span className="process-tag">动态模型</span></div>
+        <div className="section-title"><div><h2>工艺路线</h2><p>选择主体工艺并确认模型中的处理单元顺序</p></div><span className="process-tag">{dynamicSupportedProcesses.has(processType) ? "可运行动态模型" : "待建专用模型"}</span></div>
         <div className="form-grid three">
           <label className="field process-select-field"><span>主体工艺 *</span>
             <select value={processType} onChange={(event) => { setProcessType(event.target.value); markDirty(); }}>
@@ -411,7 +413,7 @@ function ProjectPage() {
           <span>关键结构</span>
           <div>{selectedProcess.features.map((feature) => <small key={feature}><CheckCircle2 size={14} />{feature}</small>)}</div>
         </div>
-        <div className="process-note"><CircleHelp size={16} /><span>流程展示包含主体生化段及必要的前后处理。实际建模时，各处理单元和回流关系将映射为 QSDsan System 中的 SanUnit 与 Stream。</span></div>
+        <div className="process-note"><CircleHelp size={16} /><span>{dynamicSupportedProcesses.has(processType) ? "当前工艺已映射为 QSDsan 动态反应器、回流和二沉池系统。" : "当前仅展示标准工艺流程，尚未建立该工艺专用动态单元和回流拓扑，因此系统会阻止将近似值作为准确结果。"}</span></div>
         {createdProject && (
           <div className="backend-record">
             <Database size={16} />
@@ -496,6 +498,12 @@ function InputPage({ navigate }: { navigate: (page: PageId) => void }) {
     setIndicators((items) => items.map((item) => item.key === key ? { ...item, value } : item));
   const numericValue = (key: string) => Number(indicators.find((item) => item.key === key)?.value ?? 0);
   const buildPayload = () => {
+    const selectedProcessType = project?.process_type ?? "AAO";
+    if (!dynamicSupportedProcesses.has(selectedProcessType)) {
+      throw new Error(
+        `当前尚未建立 ${selectedProcessType} 专用动态拓扑，请先选择 CAS、AO 或 AAO。`
+      );
+    }
     const waterQuality: WaterQuality = {
       flow_m3_d: numericValue("flow"),
       cod_mg_l: numericValue("cod"),
@@ -526,8 +534,8 @@ function InputPage({ navigate }: { navigate: (page: PageId) => void }) {
     }
     const phosphorusProcesses = new Set(["AAO", "SBR", "CASS", "UCT", "MUCT", "bardenpho5", "MBR", "IFAS"]);
     const processParameters: ProcessParameters = {
-      process_type: project?.process_type ?? "AAO",
-      model_type: phosphorusProcesses.has(project?.process_type ?? "AAO") ? "ASM2d" : "ASM1",
+      process_type: selectedProcessType,
+      model_type: phosphorusProcesses.has(selectedProcessType) ? "ASM2d" : "ASM1",
       hrt_h: Number(parameterValues.hrt),
       srt_d: Number(parameterValues.srt),
       internal_recycle_ratio: Number(parameterValues.internalRecycle) / 100,
@@ -749,11 +757,14 @@ function ResultPage({ navigate }: { navigate: (page: PageId) => void }) {
     )
   );
   const advancedTreatmentActive = Boolean(
-    parameters
-    && (
-      parameters.external_carbon_dose_mg_l > 0
-      || parameters.ferric_chloride_dose_mg_l > 0
-      || parameters.tertiary_filter_solids_capture > 0
+    simulation.advanced_treatment_applied
+    || (
+      parameters
+      && (
+        (parameters.external_carbon_dose_mg_l ?? 0) > 0
+        || (parameters.ferric_chloride_dose_mg_l ?? 0) > 0
+        || (parameters.tertiary_filter_solids_capture ?? 0) > 0
+      )
     )
   );
   const addCalibrationSample = () => {
@@ -817,7 +828,7 @@ function ResultPage({ navigate }: { navigate: (page: PageId) => void }) {
       <PageHeading eyebrow="03 / 模型计算" title="仿真结果" description="查看动态模型预测、污染物去除效果及出水达标情况。"
         action={<div className="heading-actions"><button className="button secondary" onClick={() => setCalibrationOpen((open) => !open)}><SlidersHorizontal size={17} /> 校准模型</button><button className="button primary" onClick={() => navigate("input")}><Play size={17} fill="currentColor" /> 重新计算</button></div>} />
       <div className="run-summary">
-        <div><span className="success-pulse" /><p><strong>真实模型计算完成</strong><small>{new Date(simulation.created_at).toLocaleString("zh-CN")} · 仿真编号 {simulation.simulation_id.slice(0, 8)}</small></p></div>
+        <div><span className="success-pulse" /><p><strong>{advancedTreatmentActive ? "生化与强化处理计算完成" : "基础生化计算完成"}</strong><small>{new Date(simulation.created_at).toLocaleString("zh-CN")} · 仿真编号 {simulation.simulation_id.slice(0, 8)}</small></p></div>
         <span>计算引擎 <b>{simulation.engine}</b></span>
       </div>
       <div className="result-metrics">
@@ -833,6 +844,29 @@ function ResultPage({ navigate }: { navigate: (page: PageId) => void }) {
             已叠加强化处理情景：碳源 {parameters.external_carbon_dose_mg_l} 毫克/升、
             三氯化铁 {parameters.ferric_chloride_dose_mg_l} 毫克/升、
             过滤截留率 {Math.round(parameters.tertiary_filter_solids_capture * 100)}%
+          </span>
+        </div>
+      )}
+      {!advancedTreatmentActive && passCount < 5 && (
+        <div className="info-banner treatment-result-banner untreated-warning">
+          <CircleHelp size={18} />
+          <span>
+            当前为基础生化段与二沉池预测，未启用外加碳源、化学除磷和三级过滤；
+            总氮、总磷或悬浮物超标不代表计算错误，而是当前工艺配置未满足排放限值。
+          </span>
+          <button onClick={() => navigate("input")}>配置强化处理</button>
+        </div>
+      )}
+      {advancedTreatmentActive && simulation.biological_effluent && (
+        <div className="treatment-stage-summary">
+          <strong>处理阶段可追溯</strong>
+          <span>
+            生化段出水：总氮 {simulation.biological_effluent.tn_mg_l}、总磷 {simulation.biological_effluent.tp_mg_l}、
+            悬浮物 {simulation.biological_effluent.tss_mg_l} 毫克/升
+          </span>
+          <span>
+            最终出水：总氮 {simulation.effluent.tn_mg_l}、总磷 {simulation.effluent.tp_mg_l}、
+            悬浮物 {simulation.effluent.tss_mg_l} 毫克/升
           </span>
         </div>
       )}
@@ -1033,7 +1067,7 @@ export function App() {
           <strong>{project?.plant_name ?? "尚未创建项目"}</strong>
           <small><span /> {project?.process_type ?? "待选择"} · 动态模型</small>
         </div>
-        <footer><button><CircleHelp size={17} /> 使用帮助</button><span>v0.1.0 · MVP</span></footer>
+        <footer><button><CircleHelp size={17} /> 使用帮助</button><span>v0.2.0 · 动态模型</span></footer>
       </aside>
       {menuOpen && <button className="scrim" aria-label="关闭菜单" onClick={() => setMenuOpen(false)} />}
 
