@@ -633,6 +633,10 @@ def run_dynamic_system(
             "化学需氧量未回收部分为模型计算的生物氧化量。",
             "总氮未回收部分主要为反硝化生成的氮气。",
         ]
+        if not integration_converged:
+            balance_notes.append(
+                "末端尚未达到准稳态，表观回收受系统内物质累积或释放影响，仅供诊断。"
+            )
         if params.model_type == ModelType.asm1:
             balance_notes.append("ASM1不含磷组分，总磷按随出水固体夹带估算。")
         mapping_ok = all(
@@ -652,7 +656,8 @@ def run_dynamic_system(
             passed=(
                 hydraulic_error <= 1e-5
                 and mapping_ok
-                and (not integration_converged or recovery_ok)
+                and integration_converged
+                and recovery_ok
             ),
             hydraulic_relative_error=round(hydraulic_error, 8),
             cod_recovery=round(cod_recovery, 6),
