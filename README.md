@@ -119,4 +119,5 @@ python -m modal deploy modal_app.py
 ```
 
 模型目录见 `GET /api/models`，QSDsan 动态系统的环境与校准要求见
-`docs/model-integration.md`。
+`docs/model-integration.md`，公开数据复核结果见
+`docs/public-validation.md`。

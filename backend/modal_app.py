@@ -36,6 +36,10 @@ def simulate(payload: dict, request: Request) -> dict:
 
     try:
         simulation_request = SimulationRequest.model_validate(payload)
+        if simulation_request.parameters.simulation_days > 50:
+            raise ValueError(
+                "线上同步动态仿真目前最多支持50天；更长时段需要改用异步计算任务。"
+            )
         result = run_simulation(simulation_request)
     except ValueError as error:
         raise HTTPException(status_code=422, detail=str(error)) from error

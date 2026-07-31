@@ -45,6 +45,14 @@ class WaterQuality(BaseModel):
     conductivity_us_cm: float | None = Field(default=None, ge=0)
     orp_mv: float | None = None
 
+    @model_validator(mode="after")
+    def validate_bulk_relationships(self):
+        if self.nh4_n_mg_l > self.tn_mg_l:
+            raise ValueError("氨氮不能高于总氮。")
+        if self.bod_mg_l is not None and self.bod_mg_l > self.cod_mg_l * 1.1:
+            raise ValueError("五日生化需氧量不能明显高于化学需氧量。")
+        return self
+
 
 class ProcessParameters(BaseModel):
     process_type: ProcessType = ProcessType.aao

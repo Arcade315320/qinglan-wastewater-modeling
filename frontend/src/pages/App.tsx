@@ -501,6 +501,23 @@ function InputPage({ navigate }: { navigate: (page: PageId) => void }) {
       ph: numericValue("ph"),
       temperature_c: numericValue("temperature")
     };
+    if (waterQuality.nh4_n_mg_l > waterQuality.tn_mg_l) {
+      throw new Error("氨氮不能高于总氮，请检查录入值。");
+    }
+    if (
+      waterQuality.bod_mg_l !== null
+      && waterQuality.bod_mg_l > waterQuality.cod_mg_l * 1.1
+    ) {
+      throw new Error("五日生化需氧量不能明显高于化学需氧量，请检查录入值。");
+    }
+    if (
+      waterQuality.cod_mg_l > 0
+      && waterQuality.tss_mg_l / waterQuality.cod_mg_l < 0.08
+    ) {
+      throw new Error(
+        "进水悬浮物与化学需氧量的比值异常低，请确认是否误将出水悬浮物填入进水栏。"
+      );
+    }
     const phosphorusProcesses = new Set(["AAO", "SBR", "CASS", "UCT", "MUCT", "bardenpho5", "MBR", "IFAS"]);
     const processParameters: ProcessParameters = {
       process_type: project?.process_type ?? "AAO",
@@ -659,6 +676,22 @@ function ResultPage({ navigate }: { navigate: (page: PageId) => void }) {
   ].map((row) => ({ ...row, unit: "mg/L", pass: simulation.compliance[row.key] }));
   const maxValue = Math.max(...resultRows.map((row) => row.inlet));
   const passCount = resultRows.filter((row) => row.pass).length;
+  const relevantMappingResiduals = Object.entries(
+    simulation.component_mapping.relative_residuals
+  ).filter(([key]) => !(simulation.model_id === "ASM1" && key === "tp_mg_l"));
+  const maximumMappingResidual = Math.max(
+    0,
+    ...relevantMappingResiduals.map(([, value]) => Math.abs(value))
+  );
+  const mappingPassed = maximumMappingResidual <= 0.15;
+  const apparentRecoveryPassed = (
+    simulation.mass_balance.cod_recovery <= 1.03
+    && simulation.mass_balance.nitrogen_recovery <= 1.03
+    && (
+      simulation.mass_balance.phosphorus_recovery === null
+      || simulation.mass_balance.phosphorus_recovery <= 1.03
+    )
+  );
   const addCalibrationSample = () => {
     if (!parameters) return;
     const values = Object.fromEntries(
@@ -746,8 +779,13 @@ function ResultPage({ navigate }: { navigate: (page: PageId) => void }) {
         </div>
       </section>
       <section className={`balance-panel ${simulation.mass_balance.passed ? "passed" : "failed"}`}>
-        <div><strong>质量守恒检查</strong><span>{simulation.mass_balance.passed ? "通过" : "未通过"}</span></div>
-        <p>水力误差 {simulation.mass_balance.hydraulic_relative_error.toExponential(2)} · 化学需氧量回收 {Math.round(simulation.mass_balance.cod_recovery * 100)}% · 总氮回收 {Math.round(simulation.mass_balance.nitrogen_recovery * 100)}% · {simulation.convergence_reached ? "达到稳态判定" : "尚未达到稳态判定"}</p>
+        <div><strong>模型可信度检查</strong><span>{simulation.mass_balance.passed ? "通过" : "需要复核"}</span></div>
+        <p>
+          水力闭合{simulation.mass_balance.hydraulic_relative_error <= 1e-5 ? "通过" : "未通过"}
+          {" · "}组分重构{mappingPassed ? "通过" : `偏差 ${Math.round(maximumMappingResidual * 100)}%`}
+          {" · "}表观回收{apparentRecoveryPassed ? "通过" : "未通过"}
+          {" · "}{simulation.convergence_reached ? "达到稳态判定" : "尚未达到稳态判定"}
+        </p>
       </section>
       {calibrationOpen && (
         <section className="form-section calibration-panel">

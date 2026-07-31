@@ -122,6 +122,67 @@ class QSDsanRegressionTests(unittest.TestCase):
         )
         self.assertAlmostEqual(reconstructed_p, payload.influent.tp_mg_l)
 
+    def test_bulk_fractionation_is_constrained_by_tss_and_nitrogen(self) -> None:
+        payload = SimulationRequest.model_validate(
+            {
+                "project_id": "bulk-fit",
+                "influent": {
+                    "flow_m3_d": 5000,
+                    "cod_mg_l": 260,
+                    "bod_mg_l": 120,
+                    "nh4_n_mg_l": 32,
+                    "tn_mg_l": 48,
+                    "tp_mg_l": 4.2,
+                    "tss_mg_l": 180,
+                    "ph": 7.1,
+                    "temperature_c": 22,
+                },
+                "parameters": {"model_type": "ASM2d"},
+            }
+        )
+        components, method = _bulk_components(payload)
+        reconstructed_tss = (
+            components["X_I"] * 0.75
+            + components["X_S"] * 0.75
+            + components["X_H"] * 0.9
+        )
+        reconstructed_tn = (
+            components["S_NH4"]
+            + components["S_I"] * 0.01
+            + components["S_F"] * 0.03
+            + components["X_I"] * 0.02
+            + components["X_S"] * 0.04
+            + components["X_H"] * 0.07
+        )
+        self.assertAlmostEqual(reconstructed_tss, payload.influent.tss_mg_l)
+        self.assertLess(
+            abs(reconstructed_tn - payload.influent.tn_mg_l)
+            / payload.influent.tn_mg_l,
+            0.15,
+        )
+        self.assertIn("约束", method)
+
+    def test_suspiciously_low_influent_tss_is_rejected(self) -> None:
+        payload = SimulationRequest.model_validate(
+            {
+                "project_id": "bad-tss",
+                "influent": {
+                    "flow_m3_d": 5000,
+                    "cod_mg_l": 260,
+                    "bod_mg_l": 120,
+                    "nh4_n_mg_l": 32,
+                    "tn_mg_l": 48,
+                    "tp_mg_l": 4.2,
+                    "tss_mg_l": 12,
+                    "ph": 7.1,
+                    "temperature_c": 22,
+                },
+                "parameters": {"model_type": "ASM2d"},
+            }
+        )
+        with self.assertRaisesRegex(ValueError, "比值异常低"):
+            _bulk_components(payload)
+
     def test_low_memory_instance_is_rejected_before_model_import(self) -> None:
         with patch(
             "app.services.qsdsan_adapter._memory_limit_bytes",

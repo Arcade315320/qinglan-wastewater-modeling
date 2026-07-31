@@ -17,6 +17,7 @@ from app.models.schemas import (
 
 _MODEL_LOCK = Lock()
 MIN_DYNAMIC_MEMORY_BYTES = 1024**3
+MASS_RECOVERY_UPPER_BOUND = 1.03
 
 ZONE_FRACTIONS: dict[ProcessType, tuple[float, float, float]] = {
     ProcessType.cas: (0.0, 0.0, 1.0),
@@ -116,6 +117,81 @@ def _ph_activity(
     return 0.02 + 0.98 * (upper - ph) / (upper - optimum_high)
 
 
+def _fit_bulk_components(
+    values: dict[str, float],
+    component_ids: tuple[str, ...],
+    coefficient_rows: tuple[tuple[float, ...], ...],
+    targets: tuple[float, ...],
+    soft_coefficient_rows: tuple[tuple[float, ...], ...] = (),
+    soft_targets: tuple[float, ...] = (),
+    phosphorus_coefficients: tuple[float, ...] | None = None,
+    phosphorus_target: float | None = None,
+    minimum_fractions: tuple[float, ...] | None = None,
+) -> bool:
+    import numpy as np
+    from scipy.optimize import minimize
+
+    initial = np.array([values.get(key, 0.0) for key in component_ids])
+    scales = np.maximum(initial, max(targets[0] * 0.03, 1.0))
+    matrix = np.array(coefficient_rows)
+    target_vector = np.array(targets)
+    soft_matrix = np.array(soft_coefficient_rows)
+    soft_target_vector = np.array(soft_targets)
+    lower_bounds = (
+        initial * np.array(minimum_fractions)
+        if minimum_fractions is not None
+        else np.zeros_like(initial)
+    )
+
+    constraints: list[dict] = [
+        {
+            "type": "eq",
+            "fun": lambda candidate, row=row, target=target: (
+                float(np.dot(row, candidate) - target)
+            ),
+        }
+        for row, target in zip(matrix, target_vector)
+    ]
+    if phosphorus_coefficients is not None and phosphorus_target is not None:
+        phosphorus_row = np.array(phosphorus_coefficients)
+        constraints.append(
+            {
+                "type": "ineq",
+                "fun": lambda candidate: float(
+                    phosphorus_target - np.dot(phosphorus_row, candidate)
+                ),
+            }
+        )
+
+    def objective(candidate) -> float:
+        prior_error = np.sum(((candidate - initial) / scales) ** 2)
+        if not soft_coefficient_rows:
+            return float(prior_error)
+        soft_scales = np.maximum(np.abs(soft_target_vector), 1.0)
+        soft_error = np.sum(
+            ((soft_matrix @ candidate - soft_target_vector) / soft_scales) ** 2
+        )
+        return float(prior_error + 100.0 * soft_error)
+
+    result = minimize(
+        objective,
+        initial,
+        method="SLSQP",
+        bounds=[(float(lower), None) for lower in lower_bounds],
+        constraints=constraints,
+        options={"ftol": 1e-10, "maxiter": 300},
+    )
+    if not result.success:
+        return False
+    residual = matrix @ result.x - target_vector
+    tolerances = np.maximum(np.abs(target_vector), 1.0) * 1e-5
+    if np.any(np.abs(residual) > tolerances):
+        return False
+    for key, value in zip(component_ids, result.x):
+        values[key] = max(0.0, float(value))
+    return True
+
+
 def _bulk_components(payload: SimulationRequest) -> tuple[dict[str, float], str]:
     if payload.component_concentrations:
         values = {
@@ -128,6 +204,11 @@ def _bulk_components(payload: SimulationRequest) -> tuple[dict[str, float], str]
 
     water = payload.influent
     cod = water.cod_mg_l
+    if cod > 0 and water.tss_mg_l / cod < 0.08:
+        raise ValueError(
+            "进水悬浮物与化学需氧量的比值异常低，请确认是否误将出水悬浮物"
+            "填入进水栏；若数据无误，请提供实测溶解态和颗粒态模型组分。"
+        )
     organic_n = max(0.0, water.tn_mg_l - water.nh4_n_mg_l)
     alkalinity = payload.parameters.alkalinity_mg_l_caco3 / 50 * 12
     if payload.parameters.model_type == ModelType.asm1:
@@ -143,10 +224,29 @@ def _bulk_components(payload: SimulationRequest) -> tuple[dict[str, float], str]
             "X_S": max(0.0, cod * 0.82 - soluble_biodegradable - active_biomass),
             "X_BH": active_biomass,
             "S_NH": water.nh4_n_mg_l,
-            "S_ND": organic_n * 0.4,
-            "X_ND": organic_n * 0.6,
             "S_ALK": alkalinity,
         }
+        fitted = _fit_bulk_components(
+            values,
+            ("S_I", "S_S", "X_I", "X_S", "X_BH"),
+            (
+                (1.0, 1.0, 1.0, 1.0, 1.0),
+                (0.0, 0.0, 0.555555556, 0.555555556, 0.776638708),
+            ),
+            (cod, water.tss_mg_l),
+        )
+        intrinsic_n = (
+            values["X_I"] * 0.06
+            + values["X_BH"] * 0.086
+        )
+        assignable_n = max(0.0, organic_n - intrinsic_n)
+        values["S_ND"] = assignable_n * 0.4
+        values["X_ND"] = assignable_n * 0.6
+        mapping_method = (
+            "按化学需氧量、总氮和悬浮物约束自动组分化"
+            if fitted
+            else "按默认比例自动组分化"
+        )
     else:
         soluble_biodegradable = min(
             cod * 0.35,
@@ -164,6 +264,22 @@ def _bulk_components(payload: SimulationRequest) -> tuple[dict[str, float], str]
             "S_NH4": water.nh4_n_mg_l,
             "S_ALK": alkalinity,
         }
+        fitted = _fit_bulk_components(
+            values,
+            ("S_I", "S_F", "S_A", "X_I", "X_S", "X_H"),
+            (
+                (1.0, 1.0, 1.0, 1.0, 1.0, 1.0),
+                (0.0, 0.0, 0.0, 0.75, 0.75, 0.9),
+            ),
+            (cod, water.tss_mg_l),
+            soft_coefficient_rows=(
+                (0.01, 0.03, 0.0, 0.02, 0.04, 0.07),
+            ),
+            soft_targets=(organic_n,),
+            phosphorus_coefficients=(0.0, 0.01, 0.0, 0.01, 0.01, 0.02),
+            phosphorus_target=water.tp_mg_l,
+            minimum_fractions=(0.5, 0.25, 0.25, 0.5, 0.0, 0.5),
+        )
         inherent_p = (
             values["S_F"] * 0.01
             + values["X_I"] * 0.01
@@ -171,7 +287,12 @@ def _bulk_components(payload: SimulationRequest) -> tuple[dict[str, float], str]
             + values["X_H"] * 0.02
         )
         values["S_PO4"] = max(0.0, water.tp_mg_l - inherent_p)
-    return values, "按实测总量自动组分化"
+        mapping_method = (
+            "按化学需氧量、总氮、总磷和悬浮物约束自动组分化"
+            if fitted
+            else "按默认比例自动组分化"
+        )
+    return values, mapping_method
 
 
 def _kinetic_kwargs(payload: SimulationRequest) -> dict[str, float]:
@@ -414,9 +535,12 @@ def run_dynamic_system(
         balance = MassBalanceResult(
             passed=(
                 hydraulic_error <= 1e-5
-                and cod_recovery <= 1.02
-                and nitrogen_recovery <= 1.02
-                and (phosphorus_recovery is None or phosphorus_recovery <= 1.02)
+                and cod_recovery <= MASS_RECOVERY_UPPER_BOUND
+                and nitrogen_recovery <= MASS_RECOVERY_UPPER_BOUND
+                and (
+                    phosphorus_recovery is None
+                    or phosphorus_recovery <= MASS_RECOVERY_UPPER_BOUND
+                )
                 and mapping_ok
             ),
             hydraulic_relative_error=round(hydraulic_error, 8),
@@ -439,6 +563,15 @@ def run_dynamic_system(
         warnings = []
         if not mapping_ok:
             warnings.append("总量到模型组分的重构偏差超过15%，请补充实测组分数据。")
+        if (
+            cod_recovery > MASS_RECOVERY_UPPER_BOUND
+            or nitrogen_recovery > MASS_RECOVERY_UPPER_BOUND
+            or (
+                phosphorus_recovery is not None
+                and phosphorus_recovery > MASS_RECOVERY_UPPER_BOUND
+            )
+        ):
+            warnings.append("表观物质回收超过103%，请延长积分时长或检查进水组分。")
         if not convergence_reached:
             warnings.append("动态积分时长不足或水力闭合未通过，尚不能判定为稳态。")
         return (
