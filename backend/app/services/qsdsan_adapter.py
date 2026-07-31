@@ -119,9 +119,15 @@ def _bulk_components(payload: SimulationRequest) -> tuple[dict[str, float], str]
             "X_S": max(0.0, cod * 0.82 - soluble_biodegradable - active_biomass),
             "X_H": active_biomass,
             "S_NH4": water.nh4_n_mg_l,
-            "S_PO4": water.tp_mg_l,
             "S_ALK": alkalinity,
         }
+        inherent_p = (
+            values["S_F"] * 0.01
+            + values["X_I"] * 0.01
+            + values["X_S"] * 0.01
+            + values["X_H"] * 0.02
+        )
+        values["S_PO4"] = max(0.0, water.tp_mg_l - inherent_p)
     return values, "按实测总量自动组分化"
 
 
@@ -201,6 +207,33 @@ def _safe_composite(stream, variable: str) -> float | None:
         return None
 
 
+def _integration_converged(system, simulation_days: float) -> bool:
+    import numpy as np
+
+    solution = getattr(getattr(system, "scope", None), "sol", None)
+    if (
+        solution is None
+        or not solution.success
+        or len(solution.t) < 2
+        or solution.t[-1] < simulation_days - 1e-6
+    ):
+        return False
+    window_start = max(0.0, simulation_days - min(1.0, simulation_days * 0.1))
+    start_index = int(np.searchsorted(solution.t, window_start, side="right") - 1)
+    start_index = max(0, min(start_index, len(solution.t) - 2))
+    elapsed = max(float(solution.t[-1] - solution.t[start_index]), 1e-9)
+    final_state = solution.y[:, -1]
+    previous_state = solution.y[:, start_index]
+    relative_drift = np.abs(final_state - previous_state) / np.maximum(
+        np.abs(final_state), 1.0
+    )
+    finite_drift = relative_drift[np.isfinite(relative_drift)]
+    return bool(
+        finite_drift.size
+        and np.percentile(finite_drift, 95) / elapsed <= 1e-3
+    )
+
+
 def run_dynamic_system(
     payload: SimulationRequest,
 ) -> tuple[
@@ -237,10 +270,18 @@ def run_dynamic_system(
         )
         influent = system.flowsheet.stream.wastewater
         influent.T = water.temperature_c + 273.15
-        system.simulate(
-            state_reset_hook="reset_cache",
-            t_span=(0, params.simulation_days),
-            method="BDF",
+        try:
+            system.simulate(
+                state_reset_hook="reset_cache",
+                t_span=(0, params.simulation_days),
+                method="LSODA",
+            )
+        except (ArithmeticError, RuntimeError, ValueError) as error:
+            raise ValueError(
+                "动态积分未能完成，请检查进水负荷、温度、停留时间、回流比和组分数据。"
+            ) from error
+        integration_converged = _integration_converged(
+            system, params.simulation_days
         )
         effluent = system.flowsheet.stream.effluent
         was = system.flowsheet.stream.WAS
@@ -344,7 +385,11 @@ def run_dynamic_system(
         )
         sludge_kg_d = float(was.get_TSS()) * q_was / 1000
         energy_kwh_d = params.aeration_power_kw * 24
-        convergence_reached = params.simulation_days >= 50 and hydraulic_error <= 1e-5
+        convergence_reached = (
+            params.simulation_days >= 50
+            and hydraulic_error <= 1e-5
+            and integration_converged
+        )
         warnings = []
         if not mapping_ok:
             warnings.append("总量到模型组分的重构偏差超过15%，请补充实测组分数据。")

@@ -303,7 +303,7 @@ function ProjectPage() {
     owner: "C 同学",
     location: "广东省深圳市",
     period: "2026-07-27 至 2026-08-06",
-    description: "基于实测进出水数据，对 AAO 工艺进行稳态模拟、参数校准与达标评估。",
+    description: "基于实测进出水数据，对 AAO 工艺进行动态仿真、参数校准与达标评估。",
     designScale: "5000"
   });
   const selectedProcess = processCatalog.find((item) => item.id === processType) ?? processCatalog[0];
@@ -381,7 +381,7 @@ function ProjectPage() {
       </section>
 
       <section className="form-section">
-        <div className="section-title"><div><h2>工艺路线</h2><p>选择主体工艺并确认模型中的处理单元顺序</p></div><span className="process-tag">稳态模型</span></div>
+        <div className="section-title"><div><h2>工艺路线</h2><p>选择主体工艺并确认模型中的处理单元顺序</p></div><span className="process-tag">动态模型</span></div>
         <div className="form-grid three">
           <label className="field process-select-field"><span>主体工艺 *</span>
             <select value={processType} onChange={(event) => { setProcessType(event.target.value); markDirty(); }}>
@@ -425,7 +425,7 @@ function ProjectPage() {
         <section className="form-section model-scope">
           <div className="section-title"><div><h2>模型与评价范围</h2><p>明确本次计算包含的系统边界和成果指标</p></div><Target size={19} /></div>
           <div className="form-grid">
-            <label className="field"><span>仿真模式 *</span><select defaultValue="steady" onChange={markDirty}><option value="steady">稳态仿真</option><option value="dynamic" disabled>动态仿真（后续升级）</option></select><ChevronDown size={16} /></label>
+            <label className="field"><span>仿真模式 *</span><select defaultValue="dynamic" onChange={markDirty}><option value="dynamic">动态仿真</option></select><ChevronDown size={16} /></label>
             <label className="field"><span>排放标准 *</span><select defaultValue="grade-a" onChange={markDirty}><option value="grade-a">GB 18918-2002 一级 A</option><option value="grade-b">GB 18918-2002 一级 B</option><option value="custom">自定义限值</option></select><ChevronDown size={16} /></label>
           </div>
           <fieldset className="scope-options">
@@ -706,7 +706,9 @@ function ResultPage({ navigate }: { navigate: (page: PageId) => void }) {
       setSimulation(recalculated);
       setCalibrationState("success");
       setCalibrationMessage(
-        `校准并复算完成：训练 ${result.training_sample_count} 条，验证 ${result.validation_sample_count} 条，目标函数改善 ${result.improvement_percent.toFixed(1)}%。`
+        result.improvement_percent > 0
+          ? `校准并复算完成：训练 ${result.training_sample_count} 条，验证 ${result.validation_sample_count} 条，目标函数改善 ${result.improvement_percent.toFixed(1)}%。`
+          : `候选参数未降低误差，已保留原参数并完成复算。训练 ${result.training_sample_count} 条，验证 ${result.validation_sample_count} 条。`
       );
     } catch (error) {
       setCalibrationState("error");
@@ -715,7 +717,7 @@ function ResultPage({ navigate }: { navigate: (page: PageId) => void }) {
   };
   return (
     <div className="page">
-      <PageHeading eyebrow="03 / 模型计算" title="仿真结果" description="查看稳态模型预测、污染物去除效果及出水达标情况。"
+      <PageHeading eyebrow="03 / 模型计算" title="仿真结果" description="查看动态模型预测、污染物去除效果及出水达标情况。"
         action={<div className="heading-actions"><button className="button secondary" onClick={() => setCalibrationOpen((open) => !open)}><SlidersHorizontal size={17} /> 校准模型</button><button className="button primary" onClick={() => navigate("input")}><Play size={17} fill="currentColor" /> 重新计算</button></div>} />
       <div className="run-summary">
         <div><span className="success-pulse" /><p><strong>真实模型计算完成</strong><small>{new Date(simulation.created_at).toLocaleString("zh-CN")} · 仿真编号 {simulation.simulation_id.slice(0, 8)}</small></p></div>

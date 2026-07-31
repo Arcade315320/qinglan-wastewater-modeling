@@ -221,6 +221,11 @@ def calibrate_model(payload: ModelCalibrationRequest) -> ModelCalibrationResult:
     calibrated_rows = _predictions(training_payload, factors)
     best_objective = _objective_from_rows(calibrated_rows)
     iterations = 1
+    candidate_rejected = best_objective >= initial_objective
+    if candidate_rejected:
+        factors = {name: 1.0 for name in FACTOR_FIELDS}
+        calibrated_rows = initial_rows
+        best_objective = initial_objective
     improvement = (
         (initial_objective - best_objective) / initial_objective * 100
         if initial_objective
@@ -233,8 +238,8 @@ def calibrate_model(payload: ModelCalibrationRequest) -> ModelCalibrationResult:
     )
     if inhibited_ph_count:
         warnings.append(
-            f"{inhibited_ph_count} sample(s) have pH outside 5.5-9.5; "
-            "verify sampling location and any upstream neutralization before accepting calibration."
+            f"{inhibited_ph_count}条样本的酸碱度超出5.5至9.5；"
+            "接受校准结果前，请核对采样位置和上游中和处理情况。"
         )
     boundary_factors = [
         name
@@ -243,13 +248,16 @@ def calibrate_model(payload: ModelCalibrationRequest) -> ModelCalibrationResult:
     ]
     if boundary_factors:
         warnings.append(
-            "One or more fitted factors reached the allowed boundary "
-            f"({', '.join(boundary_factors)}); the model or source data may be inconsistent."
+            "一个或多个拟合因子达到允许边界"
+            f"（{', '.join(boundary_factors)}）；模型结构或源数据可能不一致。"
+        )
+    if candidate_rejected:
+        warnings.append(
+            "候选参数增大了校准误差，已自动拒绝并保留原动力学因子。"
         )
     if improvement < 10:
         warnings.append(
-            "Calibration improved the normalized objective by less than 10%; "
-            "do not treat this fit as validated."
+            "校准后的归一化目标函数改善不足10%，不得将本次拟合视为已验证。"
         )
     validation_objective = None
     if validation_samples:
@@ -261,13 +269,11 @@ def calibrate_model(payload: ModelCalibrationRequest) -> ModelCalibrationResult:
         )
         if validation_objective > best_objective * 1.5:
             warnings.append(
-                "Validation error is more than 50% above training error; "
-                "the fitted parameters may not generalize to later dates."
+                "验证误差比训练误差高出50%以上，拟合参数可能不适用于后续日期。"
             )
     else:
         warnings.append(
-            "No validation group was created; each plant needs at least five "
-            "chronological samples for an independent holdout period."
+            "未建立独立验证时段；每座污水厂至少需要五条连续日期样本。"
         )
     return ModelCalibrationResult(
         project_id=payload.project_id,
@@ -286,8 +292,7 @@ def calibrate_model(payload: ModelCalibrationRequest) -> ModelCalibrationResult:
             else None
         ),
         recommendation=(
-            "Validate these factors on a separate date range before using them for reports "
-            "or operational decisions."
+            "用于报告或运行决策前，请在独立日期范围内验证这些因子。"
         ),
         warnings=warnings,
     )

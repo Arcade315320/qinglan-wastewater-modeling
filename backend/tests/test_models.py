@@ -11,7 +11,7 @@ from app.models.schemas import (
 )
 from app.services.calibration_service import calibrate_model
 from app.services.model_catalog import list_models
-from app.services.qsdsan_adapter import _ph_activity
+from app.services.qsdsan_adapter import _bulk_components, _ph_activity
 from app.services.simulation_service import run_simulation
 
 
@@ -86,6 +86,37 @@ class QSDsanRegressionTests(unittest.TestCase):
         self.assertEqual(_ph_activity(7.2, 5.5, 7, 8, 9.5), 1)
         self.assertLess(_ph_activity(3.8, 5.5, 7, 8, 9.5), 0.1)
 
+    def test_asm2d_total_phosphorus_is_not_double_counted(self) -> None:
+        payload = SimulationRequest.model_validate(
+            {
+                "project_id": "asm2d-mapping",
+                "influent": {
+                    "flow_m3_d": 7465,
+                    "cod_mg_l": 427.1,
+                    "bod_mg_l": 106.9,
+                    "nh4_n_mg_l": 29.8,
+                    "tn_mg_l": 43.5,
+                    "tp_mg_l": 4.03,
+                    "tss_mg_l": 204.8,
+                    "ph": 6.95,
+                    "temperature_c": 29.5,
+                },
+                "parameters": {
+                    "process_type": "AAO",
+                    "model_type": "ASM2d",
+                },
+            }
+        )
+        components, _ = _bulk_components(payload)
+        reconstructed_p = (
+            components["S_PO4"]
+            + components["S_F"] * 0.01
+            + components["X_I"] * 0.01
+            + components["X_S"] * 0.01
+            + components["X_H"] * 0.02
+        )
+        self.assertAlmostEqual(reconstructed_p, payload.influent.tp_mg_l)
+
 
 class GroupedCalibrationTests(unittest.TestCase):
     @staticmethod
@@ -144,6 +175,53 @@ class GroupedCalibrationTests(unittest.TestCase):
         self.assertEqual(result.validation_sample_count, 2)
         self.assertIsNotNone(result.validation_objective)
         self.assertGreater(result.improvement_percent, 50)
+
+    def test_worse_calibration_candidate_is_rejected(self) -> None:
+        def worsening_simulation(request):
+            factor = request.parameters.cod_kinetic_factor
+            source = request.influent
+            return SimpleNamespace(
+                effluent=EffluentPrediction(
+                    cod_mg_l=source.cod_mg_l * factor,
+                    nh4_n_mg_l=source.nh4_n_mg_l,
+                    tn_mg_l=source.tn_mg_l,
+                    tp_mg_l=source.tp_mg_l,
+                    tss_mg_l=source.tss_mg_l,
+                )
+            )
+
+        samples = []
+        for index in range(2):
+            samples.append(
+                {
+                    "group_id": "甲厂",
+                    "sample_time": datetime(2026, 1, index + 1),
+                    "influent": {
+                        "flow_m3_d": 10000,
+                        "cod_mg_l": 300,
+                        "nh4_n_mg_l": 30,
+                        "tn_mg_l": 45,
+                        "tp_mg_l": 5,
+                        "tss_mg_l": 200,
+                        "ph": 7.2,
+                        "temperature_c": 20,
+                    },
+                    "measured": {"cod_mg_l": 150},
+                }
+            )
+        request = ModelCalibrationRequest(
+            project_id="rejection-test",
+            samples=samples,
+            validation_fraction=0,
+        )
+        with patch(
+            "app.services.calibration_service.run_simulation",
+            side_effect=worsening_simulation,
+        ):
+            result = calibrate_model(request)
+        self.assertEqual(result.factors.cod, 1)
+        self.assertEqual(result.improvement_percent, 0)
+        self.assertTrue(any("自动拒绝" in item for item in result.warnings))
 
 
 if __name__ == "__main__":
