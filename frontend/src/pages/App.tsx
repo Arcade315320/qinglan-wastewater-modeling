@@ -495,7 +495,7 @@ function InputPage({ navigate }: { navigate: (page: PageId) => void }) {
     aerationPower: "15",
     dissolvedOxygen: "2",
     alkalinity: "250",
-    simulationDays: "15"
+    simulationDays: "10"
   });
   const [advancedTreatmentEnabled, setAdvancedTreatmentEnabled] = useState(false);
   const [advancedTreatmentValues, setAdvancedTreatmentValues] = useState({
@@ -526,6 +526,9 @@ function InputPage({ navigate }: { navigate: (page: PageId) => void }) {
       throw new Error(
         `当前尚未建立 ${selectedProcessType} 专用动态拓扑，请先选择 CAS、AO 或 AAO。`
       );
+    }
+    if (Number(parameterValues.simulationDays) > 10) {
+      throw new Error("当前线上免费算力最多支持 10 天动态积分。");
     }
     const waterQuality: WaterQuality = {
       flow_m3_d: numericValue("flow"),
