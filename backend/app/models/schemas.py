@@ -69,6 +69,9 @@ class ProcessParameters(BaseModel):
     nitrification_kinetic_factor: float = Field(default=1.0, ge=0.1, le=5.0)
     denitrification_kinetic_factor: float = Field(default=1.0, ge=0.1, le=5.0)
     phosphorus_kinetic_factor: float = Field(default=1.0, ge=0.1, le=5.0)
+    external_carbon_dose_mg_l: float = Field(default=0, ge=0, le=100)
+    ferric_chloride_dose_mg_l: float = Field(default=0, ge=0, le=100)
+    tertiary_filter_solids_capture: float = Field(default=0, ge=0, le=0.99)
     simulation_days: float = Field(default=50, ge=5, le=200)
 
 

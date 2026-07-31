@@ -41,6 +41,9 @@
 | `aerobic_do_mg_l` | 好氧段 DO 设定值 |
 | `alkalinity_mg_l_caco3` | 碱度，以 CaCO3 计 |
 | `clarifier_solids_capture` | 二沉池固体捕集率，0-1 |
+| `external_carbon_dose_mg_l` | 后置反硝化外加碳源，按化学需氧量当量计，毫克/升 |
+| `ferric_chloride_dose_mg_l` | 化学除磷三氯化铁投加量，毫克/升 |
+| `tertiary_filter_solids_capture` | 三级过滤固体截留率，0-0.99 |
 
 ## 3. API 清单
 

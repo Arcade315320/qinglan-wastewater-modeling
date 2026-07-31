@@ -484,6 +484,12 @@ function InputPage({ navigate }: { navigate: (page: PageId) => void }) {
     alkalinity: "250",
     simulationDays: "50"
   });
+  const [advancedTreatmentEnabled, setAdvancedTreatmentEnabled] = useState(false);
+  const [advancedTreatmentValues, setAdvancedTreatmentValues] = useState({
+    externalCarbon: "8",
+    ferricChloride: "18",
+    filterCapture: "85"
+  });
   const [runState, setRunState] = useState<"idle" | "saving" | "running" | "error">("idle");
   const [message, setMessage] = useState("");
   const updateValue = (key: string, value: string) =>
@@ -533,7 +539,16 @@ function InputPage({ navigate }: { navigate: (page: PageId) => void }) {
       cod_kinetic_factor: 1,
       nitrification_kinetic_factor: 1,
       denitrification_kinetic_factor: 1,
-      phosphorus_kinetic_factor: 1
+      phosphorus_kinetic_factor: 1,
+      external_carbon_dose_mg_l: advancedTreatmentEnabled
+        ? Number(advancedTreatmentValues.externalCarbon)
+        : 0,
+      ferric_chloride_dose_mg_l: advancedTreatmentEnabled
+        ? Number(advancedTreatmentValues.ferricChloride)
+        : 0,
+      tertiary_filter_solids_capture: advancedTreatmentEnabled
+        ? Number(advancedTreatmentValues.filterCapture) / 100
+        : 0
     };
     return { waterQuality, processParameters };
   };
@@ -608,6 +623,47 @@ function InputPage({ navigate }: { navigate: (page: PageId) => void }) {
             </label>
           ))}
         </div>
+      </section>
+      <section className="form-section">
+        <div className="section-title treatment-heading">
+          <div>
+            <h2>出水强化处理</h2>
+            <p>用于测算后置反硝化、化学除磷和三级过滤，必须与现场实际设施一致</p>
+          </div>
+          <label className="treatment-toggle">
+            <input
+              type="checkbox"
+              checked={advancedTreatmentEnabled}
+              onChange={(event) => setAdvancedTreatmentEnabled(event.target.checked)}
+            />
+            <span>{advancedTreatmentEnabled ? "已启用方案测算" : "未启用"}</span>
+          </label>
+        </div>
+        <div className="indicator-grid">
+          {[
+            ["外加碳源（化学需氧量当量）", "externalCarbon", "mg/L"],
+            ["三氯化铁投加量", "ferricChloride", "mg/L"],
+            ["三级过滤固体截留率", "filterCapture", "%"]
+          ].map(([name, key, unit]) => (
+            <label className="indicator-field" key={name}>
+              <span>{name}</span>
+              <div>
+                <input
+                  value={advancedTreatmentValues[key as keyof typeof advancedTreatmentValues]}
+                  disabled={!advancedTreatmentEnabled}
+                  onChange={(event) => setAdvancedTreatmentValues((current) => ({
+                    ...current,
+                    [key]: event.target.value
+                  }))}
+                />
+                <b>{unit}</b>
+              </div>
+            </label>
+          ))}
+        </div>
+        <p className="treatment-note">
+          推荐初始情景为碳源 8、三氯化铁 18 毫克/升、过滤截留率 85%；实际投加量必须通过现场试验校准。
+        </p>
       </section>
       <section className="form-section">
         <div className="section-title"><div><h2>运行参数</h2><p>用于设定反应器停留时间、污泥龄与回流条件</p></div></div>
@@ -692,6 +748,14 @@ function ResultPage({ navigate }: { navigate: (page: PageId) => void }) {
       || simulation.mass_balance.phosphorus_recovery <= 1.03
     )
   );
+  const advancedTreatmentActive = Boolean(
+    parameters
+    && (
+      parameters.external_carbon_dose_mg_l > 0
+      || parameters.ferric_chloride_dose_mg_l > 0
+      || parameters.tertiary_filter_solids_capture > 0
+    )
+  );
   const addCalibrationSample = () => {
     if (!parameters) return;
     const values = Object.fromEntries(
@@ -762,6 +826,16 @@ function ResultPage({ navigate }: { navigate: (page: PageId) => void }) {
         <div><Activity size={20} /><span>运行能耗</span><strong>{simulation.energy_kwh_d.toLocaleString()}</strong><small>kWh/d</small></div>
         <div><ClipboardCheck size={20} /><span>干污泥产量</span><strong>{simulation.sludge_kg_d.toLocaleString()}</strong><small>kg/d</small></div>
       </div>
+      {advancedTreatmentActive && parameters && (
+        <div className="info-banner treatment-result-banner">
+          <CheckCircle2 size={18} />
+          <span>
+            已叠加强化处理情景：碳源 {parameters.external_carbon_dose_mg_l} 毫克/升、
+            三氯化铁 {parameters.ferric_chloride_dose_mg_l} 毫克/升、
+            过滤截留率 {Math.round(parameters.tertiary_filter_solids_capture * 100)}%
+          </span>
+        </div>
+      )}
       <section className="result-section">
         <div className="section-title"><div><h2>进出水对比</h2><p>预测出水与当前排放限值对照</p></div><div className="legend"><span className="inlet-key" />进水 <span className="outlet-key" />预测出水</div></div>
         <div className="result-bars">
@@ -779,12 +853,30 @@ function ResultPage({ navigate }: { navigate: (page: PageId) => void }) {
         </div>
       </section>
       <section className={`balance-panel ${simulation.mass_balance.passed ? "passed" : "failed"}`}>
-        <div><strong>模型可信度检查</strong><span>{simulation.mass_balance.passed ? "通过" : "需要复核"}</span></div>
+        <div>
+          <strong>模型可信度检查</strong>
+          <span>
+            {simulation.mass_balance.passed
+              ? simulation.convergence_reached ? "通过" : "基础检查通过"
+              : "需要复核"}
+          </span>
+        </div>
         <p>
           水力闭合{simulation.mass_balance.hydraulic_relative_error <= 1e-5 ? "通过" : "未通过"}
           {" · "}组分重构{mappingPassed ? "通过" : `偏差 ${Math.round(maximumMappingResidual * 100)}%`}
-          {" · "}表观回收{apparentRecoveryPassed ? "通过" : "未通过"}
+          {" · "}表观回收{
+            !simulation.convergence_reached
+              ? "暂不判定"
+              : apparentRecoveryPassed ? "通过" : "未通过"
+          }
           {" · "}{simulation.convergence_reached ? "达到稳态判定" : "尚未达到稳态判定"}
+        </p>
+        <p className="recovery-detail">
+          化学需氧量 {Math.round(simulation.mass_balance.cod_recovery * 100)}%
+          {" · "}总氮 {Math.round(simulation.mass_balance.nitrogen_recovery * 100)}%
+          {simulation.mass_balance.phosphorus_recovery === null
+            ? ""
+            : ` · 总磷 ${Math.round(simulation.mass_balance.phosphorus_recovery * 100)}%`}
         </p>
       </section>
       {calibrationOpen && (

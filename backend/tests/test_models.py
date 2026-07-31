@@ -12,6 +12,7 @@ from app.models.schemas import (
 from app.services.calibration_service import calibrate_model
 from app.services.model_catalog import list_models
 from app.services.qsdsan_adapter import (
+    _apply_advanced_treatment,
     _bulk_components,
     _ph_activity,
     _require_dynamic_memory,
@@ -183,6 +184,51 @@ class QSDsanRegressionTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "比值异常低"):
             _bulk_components(payload)
 
+class AdvancedTreatmentTests(unittest.TestCase):
+    def test_advanced_treatment_meets_target_case_limits(self) -> None:
+        payload = SimulationRequest.model_validate(
+            {
+                "project_id": "advanced-treatment",
+                "influent": {
+                    "flow_m3_d": 50000,
+                    "cod_mg_l": 260,
+                    "bod_mg_l": 130,
+                    "nh4_n_mg_l": 32,
+                    "tn_mg_l": 48,
+                    "tp_mg_l": 4.2,
+                    "tss_mg_l": 180,
+                    "ph": 7.2,
+                    "temperature_c": 20,
+                },
+                "parameters": {
+                    "model_type": "ASM2d",
+                    "external_carbon_dose_mg_l": 8,
+                    "ferric_chloride_dose_mg_l": 18,
+                    "tertiary_filter_solids_capture": 0.85,
+                },
+            }
+        )
+        prediction = EffluentPrediction(
+            cod_mg_l=20.938,
+            nh4_n_mg_l=0.11,
+            tn_mg_l=15.988,
+            tp_mg_l=2.983,
+            tss_mg_l=11.875,
+        )
+        treated, energy, sludge, assumptions, warnings = _apply_advanced_treatment(
+            prediction, payload
+        )
+        self.assertLessEqual(treated.cod_mg_l, 50)
+        self.assertLessEqual(treated.nh4_n_mg_l, 5)
+        self.assertLessEqual(treated.tn_mg_l, 15)
+        self.assertLessEqual(treated.tp_mg_l, 0.5)
+        self.assertLessEqual(treated.tss_mg_l, 10)
+        self.assertGreater(energy, 0)
+        self.assertGreater(sludge, 0)
+        self.assertTrue(assumptions)
+        self.assertTrue(warnings)
+
+class MemoryRequirementTests(unittest.TestCase):
     def test_low_memory_instance_is_rejected_before_model_import(self) -> None:
         with patch(
             "app.services.qsdsan_adapter._memory_limit_bytes",

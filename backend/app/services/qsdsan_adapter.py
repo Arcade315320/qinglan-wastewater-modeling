@@ -18,6 +18,12 @@ from app.models.schemas import (
 _MODEL_LOCK = Lock()
 MIN_DYNAMIC_MEMORY_BYTES = 1024**3
 MASS_RECOVERY_UPPER_BOUND = 1.03
+DENITRIFICATION_COD_PER_N = 4.0
+FERRIC_CHLORIDE_MOLAR_MASS = 162.2
+PHOSPHORUS_MOLAR_MASS = 30.974
+FERRIC_TO_PHOSPHORUS_MOLAR_RATIO = 1.5
+CHEMICAL_PHOSPHORUS_EFFICIENCY = 0.90
+TERTIARY_FILTER_ENERGY_KWH_M3 = 0.04
 
 ZONE_FRACTIONS: dict[ProcessType, tuple[float, float, float]] = {
     ProcessType.cas: (0.0, 0.0, 1.0),
@@ -371,6 +377,87 @@ def _safe_composite(stream, variable: str) -> float | None:
         return None
 
 
+def _apply_advanced_treatment(
+    prediction: EffluentPrediction,
+    payload: SimulationRequest,
+) -> tuple[EffluentPrediction, float, float, list[str], list[str]]:
+    params = payload.parameters
+    water = payload.influent
+    carbon_dose = params.external_carbon_dose_mg_l
+    ferric_dose = params.ferric_chloride_dose_mg_l
+    filter_capture = params.tertiary_filter_solids_capture
+    if carbon_dose <= 0 and ferric_dose <= 0 and filter_capture <= 0:
+        return prediction, 0.0, 0.0, [], []
+
+    nitrate_n = max(0.0, prediction.tn_mg_l - prediction.nh4_n_mg_l)
+    denitrified_n = min(
+        nitrate_n,
+        carbon_dose / DENITRIFICATION_COD_PER_N * 0.90,
+    )
+    tn_after_denitrification = max(
+        prediction.nh4_n_mg_l,
+        prediction.tn_mg_l - denitrified_n,
+    )
+    residual_carbon_cod = carbon_dose * 0.05
+
+    phosphorus_capacity = (
+        ferric_dose
+        / FERRIC_CHLORIDE_MOLAR_MASS
+        * PHOSPHORUS_MOLAR_MASS
+        / FERRIC_TO_PHOSPHORUS_MOLAR_RATIO
+        * CHEMICAL_PHOSPHORUS_EFFICIENCY
+    )
+    chemically_removed_p = min(
+        max(0.0, prediction.tp_mg_l - 0.05),
+        phosphorus_capacity,
+    )
+    tp_after_precipitation = prediction.tp_mg_l - chemically_removed_p
+
+    filtered_tss = prediction.tss_mg_l * filter_capture
+    particulate_cod = min(prediction.cod_mg_l, prediction.tss_mg_l * 1.42)
+    filtered_cod = particulate_cod * filter_capture
+    particulate_p = min(tp_after_precipitation, prediction.tss_mg_l * 0.05)
+    filtered_p = particulate_p * filter_capture
+
+    final_prediction = EffluentPrediction(
+        cod_mg_l=round(
+            max(0.0, prediction.cod_mg_l - filtered_cod + residual_carbon_cod),
+            3,
+        ),
+        nh4_n_mg_l=prediction.nh4_n_mg_l,
+        tn_mg_l=round(max(0.0, tn_after_denitrification), 3),
+        tp_mg_l=round(
+            max(0.0, tp_after_precipitation - filtered_p),
+            3,
+        ),
+        tss_mg_l=round(max(0.0, prediction.tss_mg_l - filtered_tss), 3),
+    )
+
+    flow = water.flow_m3_d
+    chemical_sludge_kg_d = chemically_removed_p * flow / 1000 * 4.87
+    filtered_solids_kg_d = filtered_tss * flow / 1000
+    additional_sludge_kg_d = chemical_sludge_kg_d + filtered_solids_kg_d
+    additional_energy_kwh_d = (
+        flow * TERTIARY_FILTER_ENERGY_KWH_M3 if filter_capture > 0 else 0.0
+    )
+    assumptions = [
+        "后置反硝化按每去除1毫克硝酸盐氮需要4毫克可利用化学需氧量估算。",
+        "三氯化铁除磷按铁磷摩尔比1.5和90%有效利用率估算。",
+        "三级过滤按录入的固体截留率计算，并按0.04千瓦时/立方米估算能耗。",
+    ]
+    warnings = [
+        "强化处理属于工程情景计算，只有现场配置相应投加和过滤设施时才可作为实际出水预测。",
+        "碳源和混凝剂投加量应通过现场反硝化试验、烧杯试验及过滤试验校准。",
+    ]
+    return (
+        final_prediction,
+        additional_energy_kwh_d,
+        additional_sludge_kg_d,
+        assumptions,
+        warnings,
+    )
+
+
 def _integration_converged(system, simulation_days: float) -> bool:
     import numpy as np
 
@@ -407,6 +494,7 @@ def run_dynamic_system(
     float,
     float,
     bool,
+    list[str],
     list[str],
 ]:
     _require_dynamic_memory()
@@ -463,13 +551,20 @@ def run_dynamic_system(
             ammonium = _stream_concentration(effluent, "S_NH4")
             tp = float(_safe_composite(effluent, "P") or 0.0)
 
-        prediction = EffluentPrediction(
+        biological_prediction = EffluentPrediction(
             cod_mg_l=round(max(0.0, cod), 3),
             nh4_n_mg_l=round(max(0.0, ammonium), 3),
             tn_mg_l=round(max(0.0, tn), 3),
             tp_mg_l=round(max(0.0, tp), 3),
             tss_mg_l=round(max(0.0, tss), 3),
         )
+        (
+            prediction,
+            advanced_energy_kwh_d,
+            advanced_sludge_kg_d,
+            advanced_assumptions,
+            advanced_warnings,
+        ) = _apply_advanced_treatment(biological_prediction, payload)
 
         reconstructed = {
             "cod_mg_l": round(float(influent.COD), 4),
@@ -532,16 +627,19 @@ def run_dynamic_system(
             for key, value in residuals.items()
             if not (params.model_type == ModelType.asm1 and key == "tp_mg_l")
         )
+        recovery_ok = (
+            cod_recovery <= MASS_RECOVERY_UPPER_BOUND
+            and nitrogen_recovery <= MASS_RECOVERY_UPPER_BOUND
+            and (
+                phosphorus_recovery is None
+                or phosphorus_recovery <= MASS_RECOVERY_UPPER_BOUND
+            )
+        )
         balance = MassBalanceResult(
             passed=(
                 hydraulic_error <= 1e-5
-                and cod_recovery <= MASS_RECOVERY_UPPER_BOUND
-                and nitrogen_recovery <= MASS_RECOVERY_UPPER_BOUND
-                and (
-                    phosphorus_recovery is None
-                    or phosphorus_recovery <= MASS_RECOVERY_UPPER_BOUND
-                )
                 and mapping_ok
+                and (not integration_converged or recovery_ok)
             ),
             hydraulic_relative_error=round(hydraulic_error, 8),
             cod_recovery=round(cod_recovery, 6),
@@ -553,8 +651,8 @@ def run_dynamic_system(
             ),
             notes=balance_notes,
         )
-        sludge_kg_d = float(was.get_TSS()) * q_was / 1000
-        energy_kwh_d = params.aeration_power_kw * 24
+        sludge_kg_d = float(was.get_TSS()) * q_was / 1000 + advanced_sludge_kg_d
+        energy_kwh_d = params.aeration_power_kw * 24 + advanced_energy_kwh_d
         convergence_reached = (
             params.simulation_days >= 50
             and hydraulic_error <= 1e-5
@@ -563,17 +661,14 @@ def run_dynamic_system(
         warnings = []
         if not mapping_ok:
             warnings.append("总量到模型组分的重构偏差超过15%，请补充实测组分数据。")
-        if (
-            cod_recovery > MASS_RECOVERY_UPPER_BOUND
-            or nitrogen_recovery > MASS_RECOVERY_UPPER_BOUND
-            or (
-                phosphorus_recovery is not None
-                and phosphorus_recovery > MASS_RECOVERY_UPPER_BOUND
-            )
-        ):
-            warnings.append("表观物质回收超过103%，请延长积分时长或检查进水组分。")
+        if not recovery_ok:
+            if integration_converged:
+                warnings.append("稳态下表观物质回收超过103%，请检查进水组分和模型参数。")
+            else:
+                warnings.append("模型尚未达到稳态，表观物质回收暂不参与守恒判定。")
         if not convergence_reached:
             warnings.append("动态积分时长不足或水力闭合未通过，尚不能判定为稳态。")
+        warnings.extend(advanced_warnings)
         return (
             prediction,
             mapping,
@@ -581,5 +676,6 @@ def run_dynamic_system(
             round(energy_kwh_d, 3),
             round(sludge_kg_d, 3),
             convergence_reached,
+            advanced_assumptions,
             warnings,
         )

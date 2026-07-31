@@ -35,6 +35,9 @@ export type ProcessParameters = {
   nitrification_kinetic_factor: number;
   denitrification_kinetic_factor: number;
   phosphorus_kinetic_factor: number;
+  external_carbon_dose_mg_l: number;
+  ferric_chloride_dose_mg_l: number;
+  tertiary_filter_solids_capture: number;
 };
 
 export type SimulationResult = {

@@ -302,6 +302,7 @@ def run_simulation(payload: SimulationRequest) -> SimulationResult:
         energy_kwh_d,
         sludge_kg_d,
         convergence_reached,
+        advanced_assumptions,
         warnings,
     ) = run_dynamic_system(payload)
     influent = payload.influent
@@ -329,6 +330,7 @@ def run_simulation(payload: SimulationRequest) -> SimulationResult:
         },
         model_note=(
             "由QSDsan动态反应器、内回流、污泥回流和十层二沉池组成；"
+            "启用强化处理时叠加后置反硝化、化学除磷和三级过滤工程计算；"
             "自动组分化结果必须结合实测组分和独立时段校准复核。"
         ),
         component_mapping=mapping,
@@ -339,6 +341,6 @@ def run_simulation(payload: SimulationRequest) -> SimulationResult:
             "反应池总体积由实测流量和水力停留时间计算。",
             "排泥流量由目标污泥龄估算，最终应以现场排泥量替换。",
             "曝气能耗采用录入功率乘以每日运行时间。",
-        ],
+        ] + advanced_assumptions,
         warnings=warnings,
     )
