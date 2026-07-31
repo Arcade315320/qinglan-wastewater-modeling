@@ -11,7 +11,12 @@ from app.models.schemas import (
 )
 from app.services.calibration_service import calibrate_model
 from app.services.model_catalog import list_models
-from app.services.qsdsan_adapter import _bulk_components, _ph_activity
+from app.services.qsdsan_adapter import (
+    _bulk_components,
+    _ph_activity,
+    _require_dynamic_memory,
+    get_engine_status,
+)
 from app.services.simulation_service import run_simulation
 
 
@@ -116,6 +121,17 @@ class QSDsanRegressionTests(unittest.TestCase):
             + components["X_H"] * 0.02
         )
         self.assertAlmostEqual(reconstructed_p, payload.influent.tp_mg_l)
+
+    def test_low_memory_instance_is_rejected_before_model_import(self) -> None:
+        with patch(
+            "app.services.qsdsan_adapter._memory_limit_bytes",
+            return_value=512 * 1024**2,
+        ):
+            status = get_engine_status()
+            self.assertFalse(status.available)
+            self.assertIn("内存不足", status.detail)
+            with self.assertRaisesRegex(ValueError, "至少需要1 GB"):
+                _require_dynamic_memory()
 
 
 class GroupedCalibrationTests(unittest.TestCase):

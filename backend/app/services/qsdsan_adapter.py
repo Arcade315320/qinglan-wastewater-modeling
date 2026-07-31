@@ -1,6 +1,7 @@
 import platform
 from contextlib import contextmanager
 from importlib.metadata import PackageNotFoundError, version
+from pathlib import Path
 from threading import Lock
 
 from app.models.schemas import (
@@ -15,6 +16,7 @@ from app.models.schemas import (
 
 
 _MODEL_LOCK = Lock()
+MIN_DYNAMIC_MEMORY_BYTES = 1024**3
 
 ZONE_FRACTIONS: dict[ProcessType, tuple[float, float, float]] = {
     ProcessType.cas: (0.0, 0.0, 1.0),
@@ -36,6 +38,36 @@ ZONE_FRACTIONS: dict[ProcessType, tuple[float, float, float]] = {
 }
 
 
+def _memory_limit_bytes() -> int | None:
+    paths = (
+        "/sys/fs/cgroup/memory.max",
+        "/sys/fs/cgroup/memory/memory.limit_in_bytes",
+    )
+    limits = []
+    for path in paths:
+        try:
+            value = Path(path).read_text(encoding="ascii").strip()
+        except OSError:
+            continue
+        if value != "max":
+            try:
+                limits.append(int(value))
+            except ValueError:
+                continue
+    realistic = [value for value in limits if value < 1 << 60]
+    return min(realistic) if realistic else None
+
+
+def _require_dynamic_memory() -> None:
+    limit = _memory_limit_bytes()
+    if limit is not None and limit < MIN_DYNAMIC_MEMORY_BYTES:
+        available_mb = round(limit / 1024**2)
+        raise ValueError(
+            "完整动态模型至少需要1 GB可用内存，"
+            f"当前实例限制约为{available_mb} MB。请使用2 GB或更高配置。"
+        )
+
+
 def get_engine_status() -> ModelEngineStatus:
     try:
         qsdsan_version = version("qsdsan")
@@ -52,12 +84,23 @@ def get_engine_status() -> ModelEngineStatus:
             detail=detail,
         )
 
+    memory_limit = _memory_limit_bytes()
+    memory_ready = (
+        memory_limit is None or memory_limit >= MIN_DYNAMIC_MEMORY_BYTES
+    )
+    if not memory_ready:
+        detail = (
+            "模型包已安装，但当前实例内存不足；"
+            f"限制约为{round(memory_limit / 1024**2)} MB，完整动态模型需要2 GB配置。"
+        )
+    else:
+        detail = "QSDsan动态单元和官方基准系统可用。"
     return ModelEngineStatus(
-        available=True,
+        available=memory_ready,
         package="qsdsan/exposan",
         version=f"{qsdsan_version}/{exposan_version}",
         python_version=platform.python_version(),
-        detail="QSDsan dynamic units and the official EXPOsan BSM1 system are available.",
+        detail=detail,
     )
 
 
@@ -245,6 +288,7 @@ def run_dynamic_system(
     bool,
     list[str],
 ]:
+    _require_dynamic_memory()
     if payload.parameters.model_type not in (ModelType.asm1, ModelType.asm2d):
         raise ValueError("The dynamic water-line system currently supports ASM1 and ASM2d.")
 
@@ -271,9 +315,11 @@ def run_dynamic_system(
         influent = system.flowsheet.stream.wastewater
         influent.T = water.temperature_c + 273.15
         try:
+            final_window_start = max(0.0, params.simulation_days - 1.0)
             system.simulate(
                 state_reset_hook="reset_cache",
                 t_span=(0, params.simulation_days),
+                t_eval=(final_window_start, params.simulation_days),
                 method="LSODA",
             )
         except (ArithmeticError, RuntimeError, ValueError) as error:
