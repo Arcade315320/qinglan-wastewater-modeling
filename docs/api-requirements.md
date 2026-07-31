@@ -44,6 +44,7 @@
 | `external_carbon_dose_mg_l` | 后置反硝化外加碳源，按化学需氧量当量计，毫克/升 |
 | `ferric_chloride_dose_mg_l` | 化学除磷三氯化铁投加量，毫克/升 |
 | `tertiary_filter_solids_capture` | 三级过滤固体截留率，0-0.99 |
+| `simulation_days` | 动态积分时长；免费远程环境推荐20天，当前最多30天 |
 
 ## 3. API 清单
 

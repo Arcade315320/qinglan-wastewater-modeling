@@ -482,7 +482,7 @@ function InputPage({ navigate }: { navigate: (page: PageId) => void }) {
     aerationPower: "15",
     dissolvedOxygen: "2",
     alkalinity: "250",
-    simulationDays: "50"
+    simulationDays: "20"
   });
   const [advancedTreatmentEnabled, setAdvancedTreatmentEnabled] = useState(false);
   const [advancedTreatmentValues, setAdvancedTreatmentValues] = useState({

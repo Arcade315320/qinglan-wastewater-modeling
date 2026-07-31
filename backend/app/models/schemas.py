@@ -72,7 +72,7 @@ class ProcessParameters(BaseModel):
     external_carbon_dose_mg_l: float = Field(default=0, ge=0, le=100)
     ferric_chloride_dose_mg_l: float = Field(default=0, ge=0, le=100)
     tertiary_filter_solids_capture: float = Field(default=0, ge=0, le=0.99)
-    simulation_days: float = Field(default=50, ge=5, le=200)
+    simulation_days: float = Field(default=20, ge=5, le=200)
 
 
 class ProjectCreate(BaseModel):
