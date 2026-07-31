@@ -158,6 +158,23 @@ class SimulationResult(BaseModel):
     warnings: list[str] = Field(default_factory=list)
 
 
+class SimulationJobStatus(StrEnum):
+    queued = "queued"
+    running = "running"
+    completed = "completed"
+    failed = "failed"
+
+
+class SimulationJobRecord(BaseModel):
+    id: str = Field(default_factory=lambda: str(uuid4()))
+    project_id: str
+    status: SimulationJobStatus = SimulationJobStatus.queued
+    result: SimulationResult | None = None
+    error: str | None = None
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+    completed_at: datetime | None = None
+
+
 class ModelInfo(BaseModel):
     id: ModelType
     name: str

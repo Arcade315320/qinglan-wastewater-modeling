@@ -15,6 +15,8 @@ from app.models.schemas import (
     ProjectRecord,
     ReportRequest,
     ReportResult,
+    SimulationJobRecord,
+    SimulationJobStatus,
     SimulationRequest,
     SimulationResult,
 )
@@ -23,6 +25,10 @@ from app.services.project_service import project_store
 from app.services.simulation_gateway import (
     get_simulation_engine_status,
     run_simulation_dispatch,
+)
+from app.services.simulation_job_service import (
+    create_simulation_job,
+    get_simulation_job,
 )
 from app.services.spreadsheet_import_service import import_calibration_workbook
 from app.services.calibration_service import calculate_error_metrics, calibrate_model
@@ -66,6 +72,31 @@ def simulate(payload: SimulationRequest) -> SimulationResult:
         return project_store.add_simulation(run_simulation_dispatch(payload))
     except ValueError as error:
         raise HTTPException(status_code=422, detail=str(error)) from error
+
+
+@router.post(
+    "/simulate/jobs",
+    response_model=SimulationJobRecord,
+    tags=["simulation"],
+)
+def submit_simulation_job(payload: SimulationRequest) -> SimulationJobRecord:
+    if not project_store.exists(payload.project_id):
+        raise HTTPException(status_code=404, detail="Project not found")
+    return create_simulation_job(payload)
+
+
+@router.get(
+    "/simulate/jobs/{job_id}",
+    response_model=SimulationJobRecord,
+    tags=["simulation"],
+)
+def read_simulation_job(job_id: str) -> SimulationJobRecord:
+    job = get_simulation_job(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Simulation job not found")
+    if job.status == SimulationJobStatus.completed and job.result is not None:
+        project_store.add_simulation(job.result)
+    return job
 
 
 @router.post("/calibrate", response_model=CalibrationResult, tags=["calibration"])

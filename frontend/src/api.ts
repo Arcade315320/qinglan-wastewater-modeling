@@ -126,9 +126,27 @@ export const api = {
     });
   },
   simulate(projectId: string, influent: WaterQuality, parameters: ProcessParameters) {
-    return request<SimulationResult>("/api/simulate", {
+    type SimulationJob = {
+      id: string;
+      status: "queued" | "running" | "completed" | "failed";
+      result: SimulationResult | null;
+      error: string | null;
+    };
+    return request<SimulationJob>("/api/simulate/jobs", {
       method: "POST",
       body: JSON.stringify({ project_id: projectId, influent, parameters })
+    }).then(async (job) => {
+      for (let attempt = 0; attempt < 180; attempt += 1) {
+        const current = attempt === 0
+          ? job
+          : await request<SimulationJob>(`/api/simulate/jobs/${job.id}`);
+        if (current.status === "completed" && current.result) return current.result;
+        if (current.status === "failed") {
+          throw new Error(current.error ?? "动态仿真失败。");
+        }
+        await new Promise((resolve) => window.setTimeout(resolve, 2000));
+      }
+      throw new Error("动态仿真超过六分钟，请稍后重新运行。");
     });
   },
   calibrate(projectId: string, samples: CalibrationSample[]) {

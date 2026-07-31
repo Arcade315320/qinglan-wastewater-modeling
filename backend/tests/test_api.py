@@ -1,4 +1,5 @@
 import unittest
+import time
 from pathlib import Path
 from unittest.mock import Mock, patch
 
@@ -58,6 +59,49 @@ def fake_result(project_id: str) -> SimulationResult:
 
 
 class ApiWorkflowTests(unittest.TestCase):
+    def test_background_simulation_job(self) -> None:
+        client = TestClient(app)
+        project = client.post(
+            "/api/projects",
+            json={
+                "name": "后台任务测试",
+                "plant_name": "后台任务污水厂",
+                "process_type": "AAO",
+            },
+        ).json()
+        with patch(
+            "app.services.simulation_job_service.run_simulation_dispatch",
+            return_value=fake_result(project["id"]),
+        ):
+            submitted = client.post(
+                "/api/simulate/jobs",
+                json={
+                    "project_id": project["id"],
+                    "influent": {
+                        "flow_m3_d": 5000,
+                        "cod_mg_l": 300,
+                        "nh4_n_mg_l": 35,
+                        "tn_mg_l": 48,
+                        "tp_mg_l": 5,
+                        "tss_mg_l": 200,
+                        "ph": 7.2,
+                        "temperature_c": 20,
+                    },
+                },
+            )
+            self.assertEqual(submitted.status_code, 200)
+            job_id = submitted.json()["id"]
+            completed = None
+            for _ in range(20):
+                completed = client.get(f"/api/simulate/jobs/{job_id}")
+                if completed.json()["status"] == "completed":
+                    break
+                time.sleep(0.01)
+        self.assertIsNotNone(completed)
+        self.assertEqual(completed.status_code, 200)
+        self.assertEqual(completed.json()["status"], "completed")
+        self.assertEqual(completed.json()["result"]["effluent"]["tn_mg_l"], 14)
+
     def test_project_simulation_and_report_download(self) -> None:
         client = TestClient(app)
         project_response = client.post(
