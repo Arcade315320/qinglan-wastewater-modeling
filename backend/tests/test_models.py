@@ -20,7 +20,7 @@ from app.services.qsdsan_adapter import (
     get_engine_status,
 )
 from app.services.simulation_service import run_simulation
-from app.services.simulation_service import _validate_model
+from app.services.simulation_service import _resolve_limits, _validate_model
 
 
 def bsm1_payload() -> SimulationRequest:
@@ -280,6 +280,17 @@ class AdvancedTreatmentTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "尚未建立MBR专用"):
             _validate_model(payload)
 
+    def test_standard_limits_follow_temperature_and_transition_date(self) -> None:
+        payload = bsm1_payload()
+        payload.influent.temperature_c = 10
+        payload.parameters.commissioned_before_2006 = True
+        payload.parameters.assessment_date = datetime(2026, 7, 31).date()
+        limits = _resolve_limits(payload)
+        self.assertEqual(limits.nh4_n_mg_l, 8)
+        self.assertEqual(limits.tp_mg_l, 1)
+        payload.parameters.assessment_date = datetime(2028, 1, 1).date()
+        self.assertEqual(_resolve_limits(payload).tp_mg_l, 0.5)
+
 class MemoryRequirementTests(unittest.TestCase):
     def test_low_memory_instance_is_rejected_before_model_import(self) -> None:
         with patch(
@@ -342,7 +353,7 @@ class GroupedCalibrationTests(unittest.TestCase):
             validation_fraction=0.2,
         )
         with patch(
-            "app.services.calibration_service.run_simulation",
+            "app.services.calibration_service._run_activated_sludge_screening",
             side_effect=self._fake_simulation,
         ):
             result = calibrate_model(request)
@@ -390,7 +401,7 @@ class GroupedCalibrationTests(unittest.TestCase):
             validation_fraction=0,
         )
         with patch(
-            "app.services.calibration_service.run_simulation",
+            "app.services.calibration_service._run_activated_sludge_screening",
             side_effect=worsening_simulation,
         ):
             result = calibrate_model(request)

@@ -32,6 +32,7 @@ import {
   api,
   apiUrl,
   type CalibrationSample,
+  type EffluentLimits,
   type ProcessParameters,
   type ProjectRecord,
   type SimulationResult,
@@ -294,7 +295,14 @@ function HomePage({ navigate }: { navigate: (page: PageId) => void }) {
 }
 
 function ProjectPage() {
-  const { project: createdProject, setProject } = useWorkflow();
+  const {
+    project: createdProject,
+    setProject,
+    influent,
+    parameters,
+    simulation,
+    calibrationSamples
+  } = useWorkflow();
   const [processType, setProcessType] = useState("AAO");
   const [dirty, setDirty] = useState(false);
   const [saveState, setSaveState] = useState<"idle" | "saving" | "success" | "error">("idle");
@@ -309,6 +317,17 @@ function ProjectPage() {
     designScale: "5000"
   });
   const selectedProcess = processCatalog.find((item) => item.id === processType) ?? processCatalog[0];
+  const readinessItems: [string, string, boolean][] = [
+    ["项目及工艺信息", createdProject ? "已保存" : "待保存", Boolean(createdProject)],
+    ["专用动态拓扑", dynamicSupportedProcesses.has(processType) ? "已建立" : "尚未建立", dynamicSupportedProcesses.has(processType)],
+    ["进水水质数据", influent ? "已录入" : "待录入", Boolean(influent)],
+    ["运行参数", parameters ? "已录入" : "待录入", Boolean(parameters)],
+    ["动态计算与守恒", simulation?.mass_balance.passed ? "已通过" : "待通过", Boolean(simulation?.mass_balance.passed)],
+    ["出水实测校准数据", calibrationSamples.length >= 5 ? "已达到最低数量" : `${calibrationSamples.length}/5 条`, calibrationSamples.length >= 5],
+    ["独立时段验证", parameters?.independent_validation_passed ? "已完成" : "待完成", Boolean(parameters?.independent_validation_passed)]
+  ];
+  const readyCount = readinessItems.filter(([, , ready]) => ready).length;
+  const readinessPercent = Math.round(readyCount / readinessItems.length * 100);
   const markDirty = () => {
     setDirty(true);
     setSaveState("idle");
@@ -366,8 +385,8 @@ function ProjectPage() {
         </div>
         <div><small>处理工艺</small><strong>{selectedProcess.shortLabel}</strong><span>{selectedProcess.category}</span></div>
         <div><small>设计规模</small><strong>{Number(projectForm.designScale || 0).toLocaleString()}</strong><span>m³/d</span></div>
-        <div><small>评价标准</small><strong>一级 A</strong><span>GB 18918-2002</span></div>
-        <div><small>资料完整度</small><strong>78%</strong><span className="mini-progress"><i /></span></div>
+        <div><small>评价标准</small><strong>{parameters?.effluent_standard === "grade_b" ? "一级 B" : parameters?.effluent_standard === "custom" ? "项目限值" : "一级 A"}</strong><span>以计算时选择为准</span></div>
+        <div><small>资料完整度</small><strong>{readinessPercent}%</strong><span className="mini-progress"><i style={{ width: `${readinessPercent}%` }} /></span></div>
       </section>
 
       <section className="form-section">
@@ -428,7 +447,7 @@ function ProjectPage() {
           <div className="section-title"><div><h2>模型与评价范围</h2><p>明确本次计算包含的系统边界和成果指标</p></div><Target size={19} /></div>
           <div className="form-grid">
             <label className="field"><span>仿真模式 *</span><select defaultValue="dynamic" onChange={markDirty}><option value="dynamic">动态仿真</option></select><ChevronDown size={16} /></label>
-            <label className="field"><span>排放标准 *</span><select defaultValue="grade-a" onChange={markDirty}><option value="grade-a">GB 18918-2002 一级 A</option><option value="grade-b">GB 18918-2002 一级 B</option><option value="custom">自定义限值</option></select><ChevronDown size={16} /></label>
+            <label className="field"><span>排放判定配置</span><input value="在数据录入页随工况设置" readOnly /></label>
           </div>
           <fieldset className="scope-options">
             <legend>系统边界</legend>
@@ -446,17 +465,9 @@ function ProjectPage() {
 
         <aside className="readiness-panel">
           <div className="section-title"><div><h2>数据准备度</h2><p>运行模型前的必要条件</p></div><Database size={19} /></div>
-          <div className="readiness-score"><strong>78%</strong><span><i /></span><small>5 项已就绪，2 项待完善</small></div>
+          <div className="readiness-score"><strong>{readinessPercent}%</strong><span><i style={{ width: `${readinessPercent}%` }} /></span><small>{readyCount} 项已就绪，{readinessItems.length - readyCount} 项待完善</small></div>
           <div className="readiness-list">
-            {[
-              ["项目及工艺信息", "已完成", true],
-              ["进水水质数据", "已录入", true],
-              ["运行参数", "已录入", true],
-              ["出水实测数据", "待补充", false],
-              ["模型组分映射", "已配置", true],
-              ["排放限值", "已配置", true],
-              ["校准参数范围", "待确认", false]
-            ].map(([name, state, ready]) => (
+            {readinessItems.map(([name, state, ready]) => (
               <div key={String(name)}><span className={ready ? "ready" : "pending"}>{ready ? <CheckCircle2 size={15} /> : "!"}</span><strong>{name}</strong><small>{state}</small></div>
             ))}
           </div>
@@ -484,13 +495,25 @@ function InputPage({ navigate }: { navigate: (page: PageId) => void }) {
     aerationPower: "15",
     dissolvedOxygen: "2",
     alkalinity: "250",
-    simulationDays: "10"
+    simulationDays: "15"
   });
   const [advancedTreatmentEnabled, setAdvancedTreatmentEnabled] = useState(false);
   const [advancedTreatmentValues, setAdvancedTreatmentValues] = useState({
     externalCarbon: "8",
     ferricChloride: "26",
     filterCapture: "85"
+  });
+  const [standard, setStandard] = useState<"grade_a" | "grade_b" | "custom">("grade_a");
+  const [commissionedBefore2006, setCommissionedBefore2006] = useState(false);
+  const [operatingDataSource, setOperatingDataSource] = useState<"measured" | "design" | "assumed">("assumed");
+  const [advancedTreatmentVerified, setAdvancedTreatmentVerified] = useState(false);
+  const [independentValidationPassed, setIndependentValidationPassed] = useState(false);
+  const [customLimitValues, setCustomLimitValues] = useState({
+    cod: "50",
+    nh4: "5",
+    tn: "15",
+    tp: "0.5",
+    tss: "10"
   });
   const [runState, setRunState] = useState<"idle" | "saving" | "running" | "error">("idle");
   const [message, setMessage] = useState("");
@@ -556,9 +579,26 @@ function InputPage({ navigate }: { navigate: (page: PageId) => void }) {
         : 0,
       tertiary_filter_solids_capture: advancedTreatmentEnabled
         ? Number(advancedTreatmentValues.filterCapture) / 100
-        : 0
+        : 0,
+      effluent_standard: standard,
+      commissioned_before_2006: commissionedBefore2006,
+      assessment_date: new Date().toISOString().slice(0, 10),
+      operating_data_source: operatingDataSource,
+      advanced_treatment_verified: advancedTreatmentEnabled && advancedTreatmentVerified,
+      independent_validation_passed: independentValidationPassed
     };
-    return { waterQuality, processParameters };
+    const customLimits: EffluentLimits | undefined = standard === "custom"
+      ? {
+          cod_mg_l: Number(customLimitValues.cod),
+          nh4_n_mg_l: Number(customLimitValues.nh4),
+          tn_mg_l: Number(customLimitValues.tn),
+          tp_mg_l: Number(customLimitValues.tp),
+          tss_mg_l: Number(customLimitValues.tss),
+          basis: "项目实际执行的日均值",
+          source: "项目自定义排放限值"
+        }
+      : undefined;
+    return { waterQuality, processParameters, customLimits };
   };
   const saveMeasurement = async () => {
     if (!project) throw new Error("请先在项目概览中保存项目。");
@@ -584,11 +624,16 @@ function InputPage({ navigate }: { navigate: (page: PageId) => void }) {
     setMessage("正在执行动态积分，复杂工况通常需要一至五分钟，请保持页面打开。");
     try {
       if (!project) throw new Error("请先在项目概览中保存项目。");
-      const { waterQuality, processParameters } = buildPayload();
+      const { waterQuality, processParameters, customLimits } = buildPayload();
       await api.createMeasurement(project.id, waterQuality);
       setInfluent(waterQuality);
       setParameters(processParameters);
-      const result = await api.simulate(project.id, waterQuality, processParameters);
+      const result = await api.simulate(
+        project.id,
+        waterQuality,
+        processParameters,
+        customLimits
+      );
       setSimulation(result);
       setRunState("idle");
       setMessage("");
@@ -608,7 +653,9 @@ function InputPage({ navigate }: { navigate: (page: PageId) => void }) {
       setCalibrationSamples(result.samples);
       setRunState("idle");
       setMessage(
-        `已导入 ${result.imported_count} 条可校准记录，跳过 ${result.skipped_count} 条。${result.warnings[0] ?? ""}`
+        `数据质量 ${result.quality_score} 分，${result.readiness}；`
+        + `导入 ${result.imported_count} 条，跳过 ${result.skipped_count} 条。`
+        + `${result.recommendations[0] ?? result.warnings[0] ?? ""}`
       );
     } catch (error) {
       setRunState("error");
@@ -622,7 +669,7 @@ function InputPage({ navigate }: { navigate: (page: PageId) => void }) {
         action={<div className="heading-actions"><label className="button secondary file-button"><Upload size={17} /> 导入校准表格<input type="file" accept=".xlsx" onChange={(event) => importWorkbook(event.target.files?.[0])} /></label><button className="button primary" onClick={saveData} disabled={runState === "saving" || runState === "running"}><Save size={17} /> {runState === "saving" ? "处理中..." : "保存数据"}</button></div>} />
       <div className="info-banner"><CircleHelp size={18} /><span>当前数据集：2026 年 7 月日均监测数据</span><button>切换数据集</button></div>
       <section className="form-section">
-        <div className="section-title"><div><h2>进水水质</h2><p>用于构建 QSDsan 进水流对象的组分浓度</p></div><span className="validation-ok"><CheckCircle2 size={16} /> 数据格式正常</span></div>
+        <div className="section-title"><div><h2>进水水质</h2><p>用于构建 QSDsan 进水流对象的组分浓度</p></div><span className="validation-ok"><CheckCircle2 size={16} /> 基本关系已检查</span></div>
         <div className="indicator-grid">
           {indicators.map((item) => (
             <label className="indicator-field" key={item.key}>
@@ -631,6 +678,32 @@ function InputPage({ navigate }: { navigate: (page: PageId) => void }) {
             </label>
           ))}
         </div>
+      </section>
+      <section className="form-section">
+        <div className="section-title"><div><h2>判定依据与数据来源</h2><p>排放限值和证据来源直接决定结果能否用于工程复核</p></div></div>
+        <div className="form-grid three">
+          <label className="field"><span>排放判定口径</span><select value={standard} onChange={(event) => setStandard(event.target.value as typeof standard)}><option value="grade_a">国家标准一级 A（日均）</option><option value="grade_b">国家标准一级 B（日均）</option><option value="custom">项目实际执行限值</option></select><ChevronDown size={16} /></label>
+          <label className="field"><span>运行参数来源</span><select value={operatingDataSource} onChange={(event) => setOperatingDataSource(event.target.value as typeof operatingDataSource)}><option value="assumed">程序默认假设</option><option value="design">设计或竣工资料</option><option value="measured">同期现场实测</option></select><ChevronDown size={16} /></label>
+          <label className="field"><span>评估日期</span><input value={new Date().toLocaleDateString("zh-CN")} readOnly /></label>
+        </div>
+        <div className="evidence-options">
+          <label><input type="checkbox" checked={commissionedBefore2006} onChange={(event) => setCommissionedBefore2006(event.target.checked)} /><span>污水厂在 2006 年前建成，按修改单过渡期处理总磷限值</span></label>
+          <label><input type="checkbox" checked={independentValidationPassed} onChange={(event) => setIndependentValidationPassed(event.target.checked)} /><span>已使用独立日期实测数据完成验证并留存记录</span></label>
+        </div>
+        {standard === "custom" && (
+          <div className="indicator-grid custom-limits">
+            {[
+              ["化学需氧量限值", "cod"],
+              ["氨氮限值", "nh4"],
+              ["总氮限值", "tn"],
+              ["总磷限值", "tp"],
+              ["悬浮物限值", "tss"]
+            ].map(([name, key]) => (
+              <label className="indicator-field" key={key}><span>{name}</span><div><input value={customLimitValues[key as keyof typeof customLimitValues]} onChange={(event) => setCustomLimitValues((current) => ({ ...current, [key]: event.target.value }))} /><b>mg/L</b></div></label>
+            ))}
+          </div>
+        )}
+        <p className="treatment-note">国家标准判定已考虑水温不高于 12 摄氏度时的氨氮限值，以及 2025 年修改单规定的总磷过渡期；地方标准和排污许可证更严格时应选择项目实际限值。</p>
       </section>
       <section className="form-section">
         <div className="section-title treatment-heading">
@@ -672,6 +745,11 @@ function InputPage({ navigate }: { navigate: (page: PageId) => void }) {
         <p className="treatment-note">
           推荐初始情景为碳源 8、三氯化铁 26 毫克/升、过滤截留率 85%；实际投加量必须通过现场试验校准。
         </p>
+        {advancedTreatmentEnabled && (
+          <div className="evidence-options treatment-evidence">
+            <label><input type="checkbox" checked={advancedTreatmentVerified} onChange={(event) => setAdvancedTreatmentVerified(event.target.checked)} /><span>现场确有对应设施，且投加量和过滤截留率来自同期运行记录</span></label>
+          </div>
+        )}
       </section>
       <section className="form-section">
         <div className="section-title"><div><h2>运行参数</h2><p>用于设定反应器停留时间、污泥龄与回流条件</p></div></div>
@@ -692,7 +770,7 @@ function InputPage({ navigate }: { navigate: (page: PageId) => void }) {
       </section>
       {message && <div className={`save-toast inline ${runState === "error" ? "error" : ""}`} role="status">{runState === "error" ? <span>!</span> : <CheckCircle2 size={17} />}{message}</div>}
       <div className="page-footer-actions">
-        <span>计算将调用 QSDsan 动态系统并执行质量守恒检查</span>
+        <span>计算将执行动态积分、排放判定、质量守恒和工程可信度检查</span>
         <button className="button primary" onClick={runSimulation} disabled={runState === "running"}><Play size={17} fill="currentColor" /> {runState === "running" ? "正在计算..." : "运行动态仿真"}</button>
       </div>
     </div>
@@ -732,11 +810,11 @@ function ResultPage({ navigate }: { navigate: (page: PageId) => void }) {
     );
   }
   const resultRows = [
-    { name: "COD", inlet: influent.cod_mg_l, outlet: simulation.effluent.cod_mg_l, limit: 50, key: "cod" },
-    { name: "NH₄-N", inlet: influent.nh4_n_mg_l, outlet: simulation.effluent.nh4_n_mg_l, limit: 5, key: "nh4_n" },
-    { name: "TN", inlet: influent.tn_mg_l, outlet: simulation.effluent.tn_mg_l, limit: 15, key: "tn" },
-    { name: "TP", inlet: influent.tp_mg_l, outlet: simulation.effluent.tp_mg_l, limit: 0.5, key: "tp" },
-    { name: "TSS", inlet: influent.tss_mg_l, outlet: simulation.effluent.tss_mg_l, limit: 10, key: "tss" }
+    { name: "COD", inlet: influent.cod_mg_l, outlet: simulation.effluent.cod_mg_l, limit: simulation.limits.cod_mg_l, key: "cod" },
+    { name: "NH₄-N", inlet: influent.nh4_n_mg_l, outlet: simulation.effluent.nh4_n_mg_l, limit: simulation.limits.nh4_n_mg_l, key: "nh4_n" },
+    { name: "TN", inlet: influent.tn_mg_l, outlet: simulation.effluent.tn_mg_l, limit: simulation.limits.tn_mg_l, key: "tn" },
+    { name: "TP", inlet: influent.tp_mg_l, outlet: simulation.effluent.tp_mg_l, limit: simulation.limits.tp_mg_l, key: "tp" },
+    { name: "TSS", inlet: influent.tss_mg_l, outlet: simulation.effluent.tss_mg_l, limit: simulation.limits.tss_mg_l, key: "tss" }
   ].map((row) => ({ ...row, unit: "mg/L", pass: simulation.compliance[row.key] }));
   const maxValue = Math.max(...resultRows.map((row) => row.inlet));
   const passCount = resultRows.filter((row) => row.pass).length;
@@ -767,6 +845,7 @@ function ResultPage({ navigate }: { navigate: (page: PageId) => void }) {
       )
     )
   );
+  const advancedTreatmentVerified = simulation.reliability.checks["强化处理现场核实"] ?? true;
   const addCalibrationSample = () => {
     if (!parameters) return;
     const values = Object.fromEntries(
@@ -815,8 +894,8 @@ function ResultPage({ navigate }: { navigate: (page: PageId) => void }) {
       setCalibrationState("success");
       setCalibrationMessage(
         result.improvement_percent > 0
-          ? `校准并复算完成：训练 ${result.training_sample_count} 条，验证 ${result.validation_sample_count} 条，目标函数改善 ${result.improvement_percent.toFixed(1)}%。`
-          : `候选参数未降低误差，已保留原参数并完成复算。训练 ${result.training_sample_count} 条，验证 ${result.validation_sample_count} 条。`
+          ? `${result.method}完成：训练 ${result.training_sample_count} 条，验证 ${result.validation_sample_count} 条，目标函数改善 ${result.improvement_percent.toFixed(1)}%；候选因子已用完整动态模型复算当前工况。`
+          : `预校准候选参数未降低误差，已保留原参数并完成动态复算。训练 ${result.training_sample_count} 条，验证 ${result.validation_sample_count} 条。`
       );
     } catch (error) {
       setCalibrationState("error");
@@ -828,7 +907,7 @@ function ResultPage({ navigate }: { navigate: (page: PageId) => void }) {
       <PageHeading eyebrow="03 / 模型计算" title="仿真结果" description="查看动态模型预测、污染物去除效果及出水达标情况。"
         action={<div className="heading-actions"><button className="button secondary" onClick={() => setCalibrationOpen((open) => !open)}><SlidersHorizontal size={17} /> 校准模型</button><button className="button primary" onClick={() => navigate("input")}><Play size={17} fill="currentColor" /> 重新计算</button></div>} />
       <div className="run-summary">
-        <div><span className="success-pulse" /><p><strong>{advancedTreatmentActive ? "生化与强化处理计算完成" : "基础生化计算完成"}</strong><small>{new Date(simulation.created_at).toLocaleString("zh-CN")} · 仿真编号 {simulation.simulation_id.slice(0, 8)}</small></p></div>
+        <div><span className="success-pulse" /><p><strong>{advancedTreatmentActive && !advancedTreatmentVerified ? "强化处理方案测算完成" : advancedTreatmentActive ? "生化与强化处理计算完成" : "基础生化计算完成"}</strong><small>{new Date(simulation.created_at).toLocaleString("zh-CN")} · 仿真编号 {simulation.simulation_id.slice(0, 8)}</small></p></div>
         <span>计算引擎 <b>{simulation.engine}</b></span>
       </div>
       <div className="result-metrics">
@@ -837,11 +916,19 @@ function ResultPage({ navigate }: { navigate: (page: PageId) => void }) {
         <div><Activity size={20} /><span>运行能耗</span><strong>{simulation.energy_kwh_d.toLocaleString()}</strong><small>kWh/d</small></div>
         <div><ClipboardCheck size={20} /><span>干污泥产量</span><strong>{simulation.sludge_kg_d.toLocaleString()}</strong><small>kg/d</small></div>
       </div>
+      <section className={`reliability-panel ${simulation.reliability.score >= 60 ? "conditional" : "screening"}`}>
+        <div>
+          <span>工程可信度</span>
+          <strong>{simulation.reliability.score} 分 · {simulation.reliability.level}</strong>
+        </div>
+        <p>{simulation.reliability.decision}</p>
+        <small>尚缺：{simulation.reliability.blockers.join("、") || "无"}</small>
+      </section>
       {advancedTreatmentActive && parameters && (
         <div className="info-banner treatment-result-banner">
           <CheckCircle2 size={18} />
           <span>
-            已叠加强化处理情景：碳源 {parameters.external_carbon_dose_mg_l} 毫克/升、
+            {advancedTreatmentVerified ? "已叠加现场核实的强化处理：" : "已叠加强化处理方案情景："}碳源 {parameters.external_carbon_dose_mg_l} 毫克/升、
             三氯化铁 {parameters.ferric_chloride_dose_mg_l} 毫克/升、
             过滤截留率 {Math.round(parameters.tertiary_filter_solids_capture * 100)}%
           </span>
@@ -871,7 +958,7 @@ function ResultPage({ navigate }: { navigate: (page: PageId) => void }) {
         </div>
       )}
       <section className="result-section">
-        <div className="section-title"><div><h2>进出水对比</h2><p>预测出水与当前排放限值对照</p></div><div className="legend"><span className="inlet-key" />进水 <span className="outlet-key" />预测出水</div></div>
+        <div className="section-title"><div><h2>进出水对比</h2><p>{simulation.limits.source} · {simulation.limits.basis}</p></div><div className="legend"><span className="inlet-key" />进水 <span className="outlet-key" />预测出水</div></div>
         <div className="result-bars">
           {resultRows.map((row) => (
             <div className="bar-row" key={row.name}>
@@ -880,8 +967,8 @@ function ResultPage({ navigate }: { navigate: (page: PageId) => void }) {
                 <span className="inlet-bar" style={{ width: `${Math.max(8, row.inlet / maxValue * 100)}%` }} />
                 <span className="outlet-bar" style={{ width: `${Math.max(3, row.outlet / maxValue * 100)}%` }} />
               </div>
-              <span>{row.inlet} → <b>{row.outlet}</b> {row.unit}</span>
-              <em className={row.pass ? "pass" : "fail"}>{row.pass ? "达标" : "超标"}</em>
+              <span>{row.inlet} → <b>{row.outlet}</b> {row.unit}（限值 {row.limit}）</span>
+              <em className={row.pass ? "pass" : "fail"}>{row.pass ? advancedTreatmentActive && !advancedTreatmentVerified ? "情景达标" : "达标" : "超标"}</em>
             </div>
           ))}
         </div>
@@ -903,7 +990,7 @@ function ResultPage({ navigate }: { navigate: (page: PageId) => void }) {
               ? "暂不判定"
               : apparentRecoveryPassed ? "通过" : "未通过"
           }
-          {" · "}{simulation.convergence_reached ? "达到稳态判定" : "尚未达到稳态判定"}
+          {" · "}{simulation.convergence_reached ? "达到末端准稳态判定" : "尚未达到末端准稳态判定"}
         </p>
         <p className="recovery-detail">
           化学需氧量 {Math.round(simulation.mass_balance.cod_recovery * 100)}%
@@ -915,7 +1002,7 @@ function ResultPage({ navigate }: { navigate: (page: PageId) => void }) {
       </section>
       {calibrationOpen && (
         <section className="form-section calibration-panel">
-          <div className="section-title"><div><h2>实测出水校准</h2><p>同一污水厂按日期排序，最新时段自动作为独立验证集</p></div><span>{calibrationSamples.length} 条样本</span></div>
+          <div className="section-title"><div><h2>实测出水预校准</h2><p>降阶模型拟合候选因子，当前工况随后自动使用完整动态模型复算</p></div><span>{calibrationSamples.length} 条样本</span></div>
           <label className="field"><span>污水厂分组</span><input value={groupId} onChange={(event) => setGroupId(event.target.value)} /></label>
           <div className="indicator-grid">
             {[
@@ -928,7 +1015,7 @@ function ResultPage({ navigate }: { navigate: (page: PageId) => void }) {
               <label className="indicator-field" key={key}><span>实测{label}</span><div><input value={measured[key as keyof typeof measured]} onChange={(event) => setMeasured((current) => ({ ...current, [key]: event.target.value }))} /><b>mg/L</b></div></label>
             ))}
           </div>
-          <div className="calibration-actions"><button className="button secondary" onClick={addCalibrationSample}><Plus size={16} /> 加入当前样本</button><button className="button primary" onClick={runCalibration} disabled={calibrationState === "running"}><SlidersHorizontal size={16} /> {calibrationState === "running" ? "校准中..." : "执行分组校准"}</button></div>
+          <div className="calibration-actions"><button className="button secondary" onClick={addCalibrationSample}><Plus size={16} /> 加入当前样本</button><button className="button primary" onClick={runCalibration} disabled={calibrationState === "running"}><SlidersHorizontal size={16} /> {calibrationState === "running" ? "预校准中..." : "执行分组预校准"}</button></div>
           {calibrationMessage && <p className={calibrationState === "error" ? "form-message error" : "form-message"}>{calibrationMessage}</p>}
         </section>
       )}
@@ -1067,7 +1154,7 @@ export function App() {
           <strong>{project?.plant_name ?? "尚未创建项目"}</strong>
           <small><span /> {project?.process_type ?? "待选择"} · 动态模型</small>
         </div>
-        <footer><button><CircleHelp size={17} /> 使用帮助</button><span>v0.2.0 · 动态模型</span></footer>
+        <footer><button><CircleHelp size={17} /> 使用帮助</button><span>v0.3.0 · 工程复核版</span></footer>
       </aside>
       {menuOpen && <button className="scrim" aria-label="关闭菜单" onClick={() => setMenuOpen(false)} />}
 

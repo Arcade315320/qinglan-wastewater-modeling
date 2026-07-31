@@ -88,6 +88,13 @@ class SpreadsheetImportTests(unittest.TestCase):
         self.assertEqual(result.skipped_count, 0)
         self.assertEqual(result.groups, ["甲厂"])
         self.assertEqual(result.samples[0].parameters.hrt_h, 12)
+        self.assertEqual(
+            result.samples[0].parameters.operating_data_source,
+            "measured",
+        )
+        self.assertEqual(result.quality_score, 100)
+        self.assertEqual(result.readiness, "补充后校准")
+        self.assertEqual(result.duplicate_key_count, 0)
 
     def test_accepts_fourth_row_headers(self) -> None:
         result = import_calibration_workbook(
@@ -101,7 +108,10 @@ class SpreadsheetImportTests(unittest.TestCase):
         )
         self.assertEqual(result.imported_count, 0)
         self.assertEqual(result.skipped_count, 1)
+        self.assertEqual(result.readiness, "不可校准")
+        self.assertEqual(result.duplicate_key_count, 1)
         self.assertTrue(any("多条运行记录" in item for item in result.warnings))
+        self.assertTrue(any("重复键" in item for item in result.recommendations))
 
 
 if __name__ == "__main__":

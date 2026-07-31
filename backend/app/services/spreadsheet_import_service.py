@@ -6,6 +6,7 @@ from app.models.schemas import (
     CalibrationImportResult,
     ModelCalibrationSample,
     ModelType,
+    OperatingDataSource,
     PartialEffluentMeasurement,
     ProcessParameters,
     ProjectRecord,
@@ -119,11 +120,13 @@ def import_calibration_workbook(
         raise ValueError(f"工作簿缺少工作表：{', '.join(sorted(missing_sheets))}")
 
     influent_rows = _records(workbook["进水数据"])
+    effluent_rows = _records(workbook["出水数据"])
+    operation_rows = _records(workbook["运行参数"])
     effluent_by_key, duplicate_effluent = _index_rows(
-        _records(workbook["出水数据"]), "采样时间"
+        effluent_rows, "采样时间"
     )
     operation_by_key, duplicate_operation = _index_rows(
-        _records(workbook["运行参数"]), "记录时间"
+        operation_rows, "记录时间"
     )
     samples = []
     skipped = 0
@@ -254,6 +257,7 @@ def import_calibration_workbook(
                 is not None
                 else 0.98
             ),
+            operating_data_source=OperatingDataSource.measured,
         )
         samples.append(
             ModelCalibrationSample(
@@ -272,6 +276,55 @@ def import_calibration_workbook(
         warnings.append(
             "没有可用于完整模型校准的记录；不得用零值或模型默认值替代缺失实测数据。"
         )
+    coverage_fields = {
+        "进水流量": (influent_rows, "流量（立方米/日）"),
+        "进水化学需氧量": (influent_rows, "化学需氧量（毫克/升）"),
+        "进水氨氮": (influent_rows, "氨氮（毫克/升）"),
+        "进水总氮": (influent_rows, "总氮（毫克/升）"),
+        "进水总磷": (influent_rows, "总磷（毫克/升）"),
+        "进水悬浮物": (influent_rows, "悬浮物（毫克/升）"),
+        "进水酸碱度": (influent_rows, "酸碱度"),
+        "进水水温": (influent_rows, "水温（摄氏度）"),
+        "出水化学需氧量": (effluent_rows, "化学需氧量（毫克/升）"),
+        "出水氨氮": (effluent_rows, "氨氮（毫克/升）"),
+        "出水总氮": (effluent_rows, "总氮（毫克/升）"),
+        "出水总磷": (effluent_rows, "总磷（毫克/升）"),
+        "水力停留时间": (operation_rows, "水力停留时间（小时）"),
+        "污泥龄": (operation_rows, "污泥龄（日）"),
+        "内回流比": (operation_rows, "内回流比"),
+        "污泥回流比": (operation_rows, "污泥回流比"),
+        "好氧池溶解氧": (operation_rows, "好氧池溶解氧（毫克/升）"),
+        "碱度": (operation_rows, "碱度（毫克/升，以碳酸钙计）"),
+    }
+    field_coverage = {
+        name: round(
+            sum(_number(row.get(field)) is not None for row in rows)
+            / max(len(rows), 1),
+            4,
+        )
+        for name, (rows, field) in coverage_fields.items()
+    }
+    quality_score = round(
+        sum(field_coverage.values()) / max(len(field_coverage), 1) * 100
+    )
+    duplicate_key_count = len(duplicate_effluent | duplicate_operation)
+    recommendations = [
+        f"补充{name}：当前有效覆盖率仅{coverage:.0%}。"
+        for name, coverage in field_coverage.items()
+        if coverage < 0.8
+    ]
+    if duplicate_key_count:
+        recommendations.append(
+            f"处理{duplicate_key_count}个同厂同日重复键，并明确并联线或采样批次。"
+        )
+    if len(samples) < 5:
+        recommendations.append("每座污水厂至少形成五条完整配对记录，并保留独立验证时段。")
+    if len(samples) >= 5 and quality_score >= 80 and not duplicate_key_count:
+        readiness = "可进入校准"
+    elif samples:
+        readiness = "补充后校准"
+    else:
+        readiness = "不可校准"
     return CalibrationImportResult(
         project_id=project.id,
         imported_count=len(samples),
@@ -279,4 +332,9 @@ def import_calibration_workbook(
         groups=sorted({sample.group_id for sample in samples}),
         samples=samples,
         warnings=warnings,
+        quality_score=quality_score,
+        readiness=readiness,
+        field_coverage=field_coverage,
+        duplicate_key_count=duplicate_key_count,
+        recommendations=recommendations,
     )

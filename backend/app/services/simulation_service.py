@@ -1,9 +1,15 @@
 from math import exp
 
 from app.models.schemas import (
+    ComponentMappingResult,
     EffluentPrediction,
+    EffluentLimits,
+    EffluentStandard,
+    MassBalanceResult,
     ModelType,
+    OperatingDataSource,
     ProcessType,
+    ReliabilityAssessment,
     RemovalRates,
     SimulationRequest,
     SimulationResult,
@@ -58,6 +64,97 @@ def _removal(influent: float, effluent: float) -> float:
     return round(_clip((influent - effluent) / influent), 4)
 
 
+def _resolve_limits(payload: SimulationRequest) -> EffluentLimits:
+    params = payload.parameters
+    if params.effluent_standard == EffluentStandard.custom:
+        if payload.custom_limits is None:
+            raise ValueError("选择自定义排放限值时必须填写全部五项限值。")
+        return payload.custom_limits
+
+    cold_water = payload.influent.temperature_c <= 12
+    old_phosphorus_limit = (
+        params.commissioned_before_2006
+        and params.assessment_date.year < 2028
+    )
+    if params.effluent_standard == EffluentStandard.grade_b:
+        values = (60, 15 if cold_water else 8, 20, 1.5 if old_phosphorus_limit else 1, 20)
+        level = "一级B"
+    else:
+        values = (50, 8 if cold_water else 5, 15, 1 if old_phosphorus_limit else 0.5, 10)
+        level = "一级A"
+    temperature_note = "水温不高于12摄氏度" if cold_water else "水温高于12摄氏度"
+    return EffluentLimits(
+        cod_mg_l=values[0],
+        nh4_n_mg_l=values[1],
+        tn_mg_l=values[2],
+        tp_mg_l=values[3],
+        tss_mg_l=values[4],
+        source=(
+            f"GB 18918-2002（含2025年修改单）{level}，{temperature_note}，"
+            f"评估日期{params.assessment_date.isoformat()}"
+        ),
+    )
+
+
+def _assess_reliability(
+    payload: SimulationRequest,
+    mapping,
+    mass_balance,
+    convergence_reached: bool,
+    advanced_treatment_applied: bool,
+) -> ReliabilityAssessment:
+    relevant_residuals = [
+        abs(value)
+        for key, value in mapping.relative_residuals.items()
+        if not (
+            payload.parameters.model_type == ModelType.asm1
+            and key == "tp_mg_l"
+        )
+    ]
+    checks = {
+        "组分重构": max(relevant_residuals, default=0) <= 0.15,
+        "水力闭合": mass_balance.hydraulic_relative_error <= 1e-5,
+        "动态稳态": convergence_reached,
+        "实测模型组分": payload.component_concentrations is not None,
+        "同期实测运行参数": (
+            payload.parameters.operating_data_source
+            == OperatingDataSource.measured
+        ),
+        "独立时段验证": payload.parameters.independent_validation_passed,
+        "强化处理现场核实": (
+            not advanced_treatment_applied
+            or payload.parameters.advanced_treatment_verified
+        ),
+    }
+    weights = {
+        "组分重构": 15,
+        "水力闭合": 15,
+        "动态稳态": 15,
+        "实测模型组分": 15,
+        "同期实测运行参数": 15,
+        "独立时段验证": 15,
+        "强化处理现场核实": 10,
+    }
+    score = sum(weight for name, weight in weights.items() if checks[name])
+    blockers = [name for name, passed in checks.items() if not passed]
+    if score == 100:
+        level = "工程复核"
+        decision = "关键证据齐全，可用于该污水厂当前工况的工程复核。"
+    elif score >= 60:
+        level = "条件性评估"
+        decision = "可用于方案比较，补齐阻断项前不得作为达标承诺或设计依据。"
+    else:
+        level = "筛选计算"
+        decision = "仅用于模型调试和初步筛选，不得用于实际运行决策。"
+    return ReliabilityAssessment(
+        level=level,
+        score=score,
+        decision=decision,
+        checks=checks,
+        blockers=blockers,
+    )
+
+
 def _temperature_factor(temperature_c: float, theta: float) -> float:
     return theta ** (temperature_c - 20.0)
 
@@ -87,13 +184,13 @@ def _validate_model(payload: SimulationRequest) -> None:
     process = payload.parameters.process_type
     if model == ModelType.masm2d:
         raise ValueError(
-            "mASM2d requires Ca, Mg, K, Na, Cl, inorganic carbon and metal-dose inputs. "
-            "The current bulk water-quality form cannot run this model without inventing data."
+            "mASM2d需要钙、镁、钾、钠、氯、无机碳和金属投加数据；"
+            "当前总量水质表缺少这些输入，不能用假设值替代后运行。"
         )
     if model == ModelType.adm1:
         raise ValueError(
-            "ADM1 requires anaerobic substrate fractionation, VFA and gas-phase inputs. "
-            "Use ASM2d for the aerobic section of UASB+A/O until the anaerobic input form is added."
+            "ADM1需要厌氧底物分级、挥发性脂肪酸和气相数据；"
+            "厌氧输入表和专用系统完成前不能运行该模型。"
         )
     if process not in DYNAMIC_SUPPORTED_PROCESSES:
         raise ValueError(
@@ -261,11 +358,23 @@ def _run_activated_sludge_screening(payload: SimulationRequest) -> SimulationRes
         )
 
     engine_name = f"{model.value} reduced-order steady-state screening"
+    limits = _resolve_limits(payload)
+    advanced_treatment_applied = False
     return SimulationResult(
         project_id=payload.project_id,
         model_id=model,
         engine=engine_name,
         effluent=effluent,
+        biological_effluent=effluent,
+        advanced_treatment_applied=advanced_treatment_applied,
+        limits=limits,
+        reliability=ReliabilityAssessment(
+            level="筛选计算",
+            score=15,
+            decision="降阶模型仅用于快速筛选，不得作为工程结论。",
+            checks={"输入关系": True},
+            blockers=["完整动态系统", "实测模型组分", "独立时段验证"],
+        ),
         removal_rates=removal,
         energy_kwh_d=round(params.aeration_power_kw * 24, 2),
         sludge_kg_d=round(
@@ -275,17 +384,32 @@ def _run_activated_sludge_screening(payload: SimulationRequest) -> SimulationRes
             2,
         ),
         compliance={
-            "cod": effluent.cod_mg_l <= 50,
-            "nh4_n": effluent.nh4_n_mg_l <= 5,
-            "tn": effluent.tn_mg_l <= 15,
-            "tp": effluent.tp_mg_l <= 0.5,
-            "tss": effluent.tss_mg_l <= 10,
+            "cod": effluent.cod_mg_l <= limits.cod_mg_l,
+            "nh4_n": effluent.nh4_n_mg_l <= limits.nh4_n_mg_l,
+            "tn": effluent.tn_mg_l <= limits.tn_mg_l,
+            "tp": effluent.tp_mg_l <= limits.tp_mg_l,
+            "tss": effluent.tss_mg_l <= limits.tss_mg_l,
         },
         model_note=(
             "Fast screening calculation based on QSDsan/IWA ASM kinetic defaults. "
             "Production decisions require the full QSDsan dynamic system and calibration "
             "against plant influent/effluent time series."
         ),
+        component_mapping=ComponentMappingResult(
+            method="降阶模型默认组分比例",
+            concentrations_mg_l={},
+            reconstructed={},
+            relative_residuals={},
+        ),
+        mass_balance=MassBalanceResult(
+            passed=False,
+            hydraulic_relative_error=0,
+            cod_recovery=0,
+            nitrogen_recovery=0,
+            notes=["降阶筛选不执行动态质量守恒判定。"],
+        ),
+        convergence_reached=False,
+        simulation_days=params.simulation_days,
         assumptions=[
             f"Process-zone fractions (anaerobic/anoxic/aerobic): "
             f"{anaerobic_f:.2f}/{anoxic_f:.2f}/{aerobic_f:.2f}.",
@@ -299,7 +423,7 @@ def _run_activated_sludge_screening(payload: SimulationRequest) -> SimulationRes
             f"{params.nitrification_kinetic_factor:.3f}/"
             f"{params.denitrification_kinetic_factor:.3f}/"
             f"{params.phosphorus_kinetic_factor:.3f}.",
-            "Effluent limits: COD 50, NH4-N 5, TN 15, TP 0.5 and TSS 10 mg/L.",
+            f"排放判定依据：{limits.source}，{limits.basis}。",
         ],
         warnings=warnings,
     )
@@ -329,6 +453,27 @@ def run_simulation(payload: SimulationRequest) -> SimulationResult:
         tp=_removal(influent.tp_mg_l, effluent.tp_mg_l),
         tss=_removal(influent.tss_mg_l, effluent.tss_mg_l),
     )
+    limits = _resolve_limits(payload)
+    advanced_treatment_applied = (
+        payload.parameters.external_carbon_dose_mg_l > 0
+        or payload.parameters.ferric_chloride_dose_mg_l > 0
+        or payload.parameters.tertiary_filter_solids_capture > 0
+    )
+    reliability = _assess_reliability(
+        payload,
+        mapping,
+        mass_balance,
+        convergence_reached,
+        advanced_treatment_applied,
+    )
+    if (
+        advanced_treatment_applied
+        and not payload.parameters.advanced_treatment_verified
+    ):
+        warnings.append(
+            "强化处理尚未标记为现场核实，本次最终出水只能作为方案情景，"
+            "不能作为污水厂实际出水结论。"
+        )
     return SimulationResult(
         project_id=payload.project_id,
         model_id=payload.parameters.model_type,
@@ -338,20 +483,18 @@ def run_simulation(payload: SimulationRequest) -> SimulationResult:
         ),
         effluent=effluent,
         biological_effluent=biological_effluent,
-        advanced_treatment_applied=(
-            payload.parameters.external_carbon_dose_mg_l > 0
-            or payload.parameters.ferric_chloride_dose_mg_l > 0
-            or payload.parameters.tertiary_filter_solids_capture > 0
-        ),
+        advanced_treatment_applied=advanced_treatment_applied,
+        limits=limits,
+        reliability=reliability,
         removal_rates=removal,
         energy_kwh_d=energy_kwh_d,
         sludge_kg_d=sludge_kg_d,
         compliance={
-            "cod": effluent.cod_mg_l <= 50,
-            "nh4_n": effluent.nh4_n_mg_l <= 5,
-            "tn": effluent.tn_mg_l <= 15,
-            "tp": effluent.tp_mg_l <= 0.5,
-            "tss": effluent.tss_mg_l <= 10,
+            "cod": effluent.cod_mg_l <= limits.cod_mg_l,
+            "nh4_n": effluent.nh4_n_mg_l <= limits.nh4_n_mg_l,
+            "tn": effluent.tn_mg_l <= limits.tn_mg_l,
+            "tp": effluent.tp_mg_l <= limits.tp_mg_l,
+            "tss": effluent.tss_mg_l <= limits.tss_mg_l,
         },
         model_note=(
             "由QSDsan分段动态反应器、内回流、污泥回流和十层二沉池组成；"

@@ -204,11 +204,23 @@ button { cursor: pointer; }
 .treatment-toggle input { width: 18px; height: 18px; accent-color: #168267; }
 .indicator-field input:disabled { background: #f1f4f3; color: #8b9995; cursor: not-allowed; }
 .treatment-note { margin: 15px 0 0; color: #667772; font-size: 13px; line-height: 1.6; }
+.evidence-options { display: flex; flex-wrap: wrap; gap: 12px 24px; margin-top: 16px; border-top: 1px solid #e2e9e6; padding-top: 14px; }
+.evidence-options label { display: inline-flex; align-items: center; gap: 8px; color: #53665f; font-size: 12px; cursor: pointer; }
+.evidence-options input { width: 17px; height: 17px; accent-color: #168267; }
+.custom-limits { margin-top: 16px; }
+.treatment-evidence { border-top-style: dashed; }
 .treatment-result-banner { margin-top: 20px; }
 .untreated-warning { border-left-color: #c5891d; background: #fbf4e5; color: #775b22; }
 .untreated-warning button { white-space: nowrap; color: #8a6113; cursor: pointer; }
 .treatment-stage-summary { display: grid; grid-template-columns: auto 1fr 1fr; align-items: center; gap: 16px; margin-top: 12px; border: 1px solid #d5e5df; padding: 12px 14px; background: #f7faf9; color: #5c7069; font-size: 11px; }
 .treatment-stage-summary strong { color: #236c59; }
+.reliability-panel { display: grid; grid-template-columns: auto 1fr auto; align-items: center; gap: 18px; margin-top: 18px; border-left: 3px solid #b47b1d; padding: 14px 16px; background: #fbf5e8; }
+.reliability-panel > div { display: grid; gap: 3px; }
+.reliability-panel span, .reliability-panel small { color: #76643f; font-size: 10px; }
+.reliability-panel strong { color: #6f5319; font-size: 14px; }
+.reliability-panel p { margin: 0; color: #5f625d; font-size: 11px; }
+.reliability-panel.conditional { border-left-color: #30816b; background: #eef7f3; }
+.reliability-panel.conditional strong { color: #1b6e59; }
 .recovery-detail { margin-top: 7px !important; color: #667772 !important; font-size: 13px; }
 .indicator-field { display: grid; gap: 6px; }
 .indicator-field > span { color: #52625d; font-size: 11px; font-weight: 700; }
@@ -375,6 +387,7 @@ button { cursor: pointer; }
   .result-note { grid-template-columns: 24px 1fr; }
   .result-note .text-button { grid-column: 2; justify-self: start; }
   .run-summary { align-items: flex-start; flex-direction: column; }
+  .reliability-panel { grid-template-columns: 1fr; gap: 7px; }
   .treatment-stage-summary { grid-template-columns: 1fr; gap: 7px; }
   .format-picker { grid-template-columns: 1fr; }
   .format-picker legend { grid-column: 1; }

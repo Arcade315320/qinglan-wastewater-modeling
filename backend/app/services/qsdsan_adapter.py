@@ -667,8 +667,7 @@ def run_dynamic_system(
         sludge_kg_d = float(was.get_TSS()) * q_was / 1000 + advanced_sludge_kg_d
         energy_kwh_d = params.aeration_power_kw * 24 + advanced_energy_kwh_d
         convergence_reached = (
-            params.simulation_days >= 50
-            and hydraulic_error <= 1e-5
+            hydraulic_error <= 1e-5
             and integration_converged
         )
         warnings = []
@@ -694,7 +693,10 @@ def run_dynamic_system(
                 warnings.append("模型尚未达到稳态，表观物质回收暂不参与守恒判定。")
         if not convergence_reached:
             if hydraulic_error <= 1e-5:
-                warnings.append("水力闭合已通过，但动态积分时长不足，尚不能判定为稳态。")
+                warnings.append(
+                    "水力闭合已通过，但末端状态漂移仍超过阈值；"
+                    "请延长积分时长或检查初始污泥浓度、负荷和回流参数。"
+                )
             else:
                 warnings.append("水力闭合未通过，尚不能判定为稳态。")
         warnings.extend(advanced_warnings)

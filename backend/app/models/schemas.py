@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import date, datetime
 from enum import StrEnum
 from uuid import uuid4
 
@@ -29,6 +29,28 @@ class ModelType(StrEnum):
     asm2d = "ASM2d"
     masm2d = "mASM2d"
     adm1 = "ADM1"
+
+
+class EffluentStandard(StrEnum):
+    grade_a = "grade_a"
+    grade_b = "grade_b"
+    custom = "custom"
+
+
+class OperatingDataSource(StrEnum):
+    measured = "measured"
+    design = "design"
+    assumed = "assumed"
+
+
+class EffluentLimits(BaseModel):
+    cod_mg_l: float = Field(gt=0)
+    nh4_n_mg_l: float = Field(gt=0)
+    tn_mg_l: float = Field(gt=0)
+    tp_mg_l: float = Field(gt=0)
+    tss_mg_l: float = Field(gt=0)
+    basis: str = "日均值"
+    source: str
 
 
 class WaterQuality(BaseModel):
@@ -73,6 +95,12 @@ class ProcessParameters(BaseModel):
     ferric_chloride_dose_mg_l: float = Field(default=0, ge=0, le=100)
     tertiary_filter_solids_capture: float = Field(default=0, ge=0, le=0.99)
     simulation_days: float = Field(default=10, ge=5, le=200)
+    effluent_standard: EffluentStandard = EffluentStandard.grade_a
+    commissioned_before_2006: bool = False
+    assessment_date: date = Field(default_factory=date.today)
+    operating_data_source: OperatingDataSource = OperatingDataSource.assumed
+    advanced_treatment_verified: bool = False
+    independent_validation_passed: bool = False
 
 
 class ProjectCreate(BaseModel):
@@ -104,6 +132,16 @@ class SimulationRequest(BaseModel):
     influent: WaterQuality
     parameters: ProcessParameters = Field(default_factory=ProcessParameters)
     component_concentrations: dict[str, float] | None = None
+    custom_limits: EffluentLimits | None = None
+
+    @model_validator(mode="after")
+    def require_custom_limits(self):
+        if (
+            self.parameters.effluent_standard == EffluentStandard.custom
+            and self.custom_limits is None
+        ):
+            raise ValueError("选择自定义排放限值时必须填写全部五项限值。")
+        return self
 
 
 class EffluentPrediction(BaseModel):
@@ -138,6 +176,14 @@ class MassBalanceResult(BaseModel):
     notes: list[str] = Field(default_factory=list)
 
 
+class ReliabilityAssessment(BaseModel):
+    level: str
+    score: int = Field(ge=0, le=100)
+    decision: str
+    checks: dict[str, bool]
+    blockers: list[str] = Field(default_factory=list)
+
+
 class SimulationResult(BaseModel):
     simulation_id: str = Field(default_factory=lambda: str(uuid4()))
     created_at: datetime = Field(default_factory=datetime.utcnow)
@@ -147,6 +193,8 @@ class SimulationResult(BaseModel):
     effluent: EffluentPrediction
     biological_effluent: EffluentPrediction | None = None
     advanced_treatment_applied: bool = False
+    limits: EffluentLimits
+    reliability: ReliabilityAssessment
     removal_rates: RemovalRates
     energy_kwh_d: float
     sludge_kg_d: float
@@ -276,6 +324,7 @@ class ModelCalibrationResult(BaseModel):
     training_sample_count: int
     validation_sample_count: int
     validation_objective: float | None = None
+    method: str = "降阶模型预校准"
     recommendation: str
     warnings: list[str] = Field(default_factory=list)
 
@@ -287,6 +336,11 @@ class CalibrationImportResult(BaseModel):
     groups: list[str]
     samples: list[ModelCalibrationSample]
     warnings: list[str] = Field(default_factory=list)
+    quality_score: int = Field(default=0, ge=0, le=100)
+    readiness: str = "不可校准"
+    field_coverage: dict[str, float] = Field(default_factory=dict)
+    duplicate_key_count: int = 0
+    recommendations: list[str] = Field(default_factory=list)
 
 
 class ReportFormat(StrEnum):

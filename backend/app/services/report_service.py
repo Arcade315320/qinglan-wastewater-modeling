@@ -22,6 +22,15 @@ INDICATOR_LABELS = {
 }
 
 
+def _compliance_label(simulation: SimulationResult, passed: bool) -> str:
+    if not passed:
+        return "超标"
+    verified = simulation.reliability.checks.get("强化处理现场核实", True)
+    if simulation.advanced_treatment_applied and not verified:
+        return "情景达标"
+    return "达标"
+
+
 def _safe_filename(value: str) -> str:
     allowed = "".join(
         character
@@ -100,12 +109,14 @@ def _create_pdf(
             f"主体工艺：{project.process_type.value}<br/>"
             f"计算引擎：{simulation.engine}<br/>"
             f"结果范围：{'生化段加强化处理最终出水' if simulation.advanced_treatment_applied else '基础生化段与二沉池出水'}<br/>"
+            f"排放判定：{simulation.limits.source}，{simulation.limits.basis}<br/>"
+            f"可信度等级：{simulation.reliability.level}（{simulation.reliability.score}分）<br/>"
             f"计算时间：{simulation.created_at:%Y-%m-%d %H:%M}",
             body_style,
         ),
         Paragraph("二、出水预测与达标结果", heading_style),
     ]
-    rows = [["指标", "生化段出水", "最终出水", "去除率", "是否达标"]]
+    rows = [["指标", "生化段", "最终出水", "限值", "去除率", "判定"]]
     effluent = simulation.effluent.model_dump()
     biological = (
         simulation.biological_effluent.model_dump()
@@ -115,25 +126,26 @@ def _create_pdf(
     removals = simulation.removal_rates.model_dump()
     compliance = simulation.compliance
     indicator_keys = [
-        ("cod_mg_l", "cod"),
-        ("nh4_n_mg_l", "nh4_n"),
-        ("tn_mg_l", "tn"),
-        ("tp_mg_l", "tp"),
-        ("tss_mg_l", "tss"),
+        ("cod_mg_l", "cod", simulation.limits.cod_mg_l),
+        ("nh4_n_mg_l", "nh4_n", simulation.limits.nh4_n_mg_l),
+        ("tn_mg_l", "tn", simulation.limits.tn_mg_l),
+        ("tp_mg_l", "tp", simulation.limits.tp_mg_l),
+        ("tss_mg_l", "tss", simulation.limits.tss_mg_l),
     ]
-    for effluent_key, result_key in indicator_keys:
+    for effluent_key, result_key, limit in indicator_keys:
         rows.append(
             [
                 INDICATOR_LABELS[effluent_key],
                 f"{biological[effluent_key]:.3f}",
                 f"{effluent[effluent_key]:.3f}",
+                f"{limit:.3f}",
                 f"{removals[result_key] * 100:.1f}%",
-                "达标" if compliance[result_key] else "超标",
+                _compliance_label(simulation, compliance[result_key]),
             ]
         )
     table = Table(
         rows,
-        colWidths=[36 * mm, 34 * mm, 34 * mm, 27 * mm, 24 * mm],
+        colWidths=[31 * mm, 27 * mm, 27 * mm, 23 * mm, 25 * mm, 22 * mm],
     )
     table.setStyle(
         TableStyle(
@@ -158,10 +170,16 @@ def _create_pdf(
                 f"化学需氧量回收比例：{simulation.mass_balance.cod_recovery:.3f}<br/>"
                 f"总氮回收比例：{simulation.mass_balance.nitrogen_recovery:.3f}<br/>"
                 f"质量守恒检查：{'通过' if simulation.mass_balance.passed else '未通过'}<br/>"
-                f"稳态判定：{'达到' if simulation.convergence_reached else '尚未达到'}",
+                f"末端准稳态判定：{'达到' if simulation.convergence_reached else '尚未达到'}",
                 body_style,
             ),
-            Paragraph("四、假设与提示", heading_style),
+            Paragraph("四、工程适用性", heading_style),
+            Paragraph(
+                f"结论：{simulation.reliability.decision}<br/>"
+                f"尚缺证据：{'、'.join(simulation.reliability.blockers) or '无'}",
+                body_style,
+            ),
+            Paragraph("五、假设与提示", heading_style),
         ]
     )
     for item in simulation.assumptions + simulation.warnings:
@@ -189,6 +207,11 @@ def _create_excel(
         ("污水厂名称", project.plant_name),
         ("主体工艺", project.process_type.value),
         ("计算引擎", simulation.engine),
+        ("排放判定", f"{simulation.limits.source}，{simulation.limits.basis}"),
+        (
+            "可信度等级",
+            f"{simulation.reliability.level}（{simulation.reliability.score}分）",
+        ),
         (
             "结果范围",
             "生化段加强化处理最终出水"
@@ -198,7 +221,7 @@ def _create_excel(
         ("仿真编号", simulation.simulation_id),
         ("计算时间", simulation.created_at.strftime("%Y-%m-%d %H:%M:%S")),
         (),
-        ("指标", "生化段出水", "最终出水", "去除率", "达标情况"),
+        ("指标", "生化段出水", "最终出水", "限值", "去除率", "达标情况"),
     ]
     effluent = simulation.effluent.model_dump()
     biological = (
@@ -207,31 +230,38 @@ def _create_excel(
         else effluent
     )
     removals = simulation.removal_rates.model_dump()
-    for effluent_key, result_key in (
-        ("cod_mg_l", "cod"),
-        ("nh4_n_mg_l", "nh4_n"),
-        ("tn_mg_l", "tn"),
-        ("tp_mg_l", "tp"),
-        ("tss_mg_l", "tss"),
+    for effluent_key, result_key, limit in (
+        ("cod_mg_l", "cod", simulation.limits.cod_mg_l),
+        ("nh4_n_mg_l", "nh4_n", simulation.limits.nh4_n_mg_l),
+        ("tn_mg_l", "tn", simulation.limits.tn_mg_l),
+        ("tp_mg_l", "tp", simulation.limits.tp_mg_l),
+        ("tss_mg_l", "tss", simulation.limits.tss_mg_l),
     ):
         rows.append(
             (
                 INDICATOR_LABELS[effluent_key],
                 biological[effluent_key],
                 effluent[effluent_key],
+                limit,
                 removals[result_key],
-                "达标" if simulation.compliance[result_key] else "超标",
+                _compliance_label(simulation, simulation.compliance[result_key]),
             )
         )
     for row in rows:
         summary.append(row)
-    summary.freeze_panes = "A10"
+    header_row = next(
+        index
+        for index, row in enumerate(rows, start=1)
+        if row and row[0] == "指标"
+    )
+    summary.freeze_panes = f"A{header_row + 1}"
     summary.column_dimensions["A"].width = 24
     summary.column_dimensions["B"].width = 42
     summary.column_dimensions["C"].width = 16
     summary.column_dimensions["D"].width = 16
     summary.column_dimensions["E"].width = 16
-    for cell in summary[9]:
+    summary.column_dimensions["F"].width = 16
+    for cell in summary[header_row]:
         cell.font = Font(bold=True, color="174F43")
         cell.fill = PatternFill("solid", fgColor="DCEFE8")
 
@@ -246,6 +276,9 @@ def _create_excel(
     mapping.append(("总氮回收比例", simulation.mass_balance.nitrogen_recovery))
     mapping.append(("总磷回收比例", simulation.mass_balance.phosphorus_recovery))
     mapping.append(("质量守恒是否通过", "是" if simulation.mass_balance.passed else "否"))
+    mapping.append(("可信度等级", simulation.reliability.level))
+    mapping.append(("可信度分数", simulation.reliability.score))
+    mapping.append(("工程阻断项", "、".join(simulation.reliability.blockers)))
     mapping.column_dimensions["A"].width = 30
     mapping.column_dimensions["B"].width = 24
     for sheet in workbook.worksheets:

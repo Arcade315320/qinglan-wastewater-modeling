@@ -22,6 +22,22 @@ def fake_result(project_id: str) -> SimulationResult:
                 "tp_mg_l": 0.4,
                 "tss_mg_l": 8,
             },
+            "limits": {
+                "cod_mg_l": 50,
+                "nh4_n_mg_l": 5,
+                "tn_mg_l": 15,
+                "tp_mg_l": 0.5,
+                "tss_mg_l": 10,
+                "basis": "日均值",
+                "source": "接口测试限值",
+            },
+            "reliability": {
+                "level": "工程复核",
+                "score": 100,
+                "decision": "接口测试",
+                "checks": {"接口": True},
+                "blockers": [],
+            },
             "removal_rates": {
                 "cod": 0.85,
                 "nh4_n": 0.94,

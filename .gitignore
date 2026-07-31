@@ -1,5 +1,6 @@
 backend/.venv/
 backend/.venv-model/
+.venv/
 backend/generated_reports/
 backend/app/assets/*.ttf
 frontend/node_modules/

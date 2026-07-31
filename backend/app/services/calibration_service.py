@@ -12,7 +12,7 @@ from app.models.schemas import (
     ProcessParameters,
     SimulationRequest,
 )
-from app.services.simulation_service import run_simulation
+from app.services.simulation_service import _run_activated_sludge_screening
 
 
 FACTOR_FIELDS = {
@@ -75,7 +75,7 @@ def _predictions(
     rows = []
     for sample in payload.samples:
         parameters = _apply_factors(sample.parameters, factors)
-        result = run_simulation(
+        result = _run_activated_sludge_screening(
             SimulationRequest(
                 project_id=payload.project_id,
                 influent=sample.influent,
@@ -102,7 +102,7 @@ def _objective(
             scale = max(abs(actual), INDICATOR_SCALES[indicator])
             squared_errors.append(((predicted[indicator] - actual) / scale) ** 2)
     if not squared_errors:
-        raise ValueError("Calibration requires at least one COD, NH4-N, TN or TP measurement")
+        raise ValueError("校准至少需要一项化学需氧量、氨氮、总氮或总磷实测值。")
     return sqrt(sum(squared_errors) / len(squared_errors))
 
 
@@ -117,7 +117,7 @@ def _objective_from_rows(
             scale = max(abs(actual), INDICATOR_SCALES[indicator])
             squared_errors.append(((predicted[indicator] - actual) / scale) ** 2)
     if not squared_errors:
-        raise ValueError("Calibration requires COD, NH4-N, TN or TP measurements")
+        raise ValueError("校准需要化学需氧量、氨氮、总氮或总磷实测值。")
     return sqrt(sum(squared_errors) / len(squared_errors))
 
 
@@ -209,7 +209,7 @@ def calibrate_model(payload: ModelCalibrationRequest) -> ModelCalibrationResult:
         else:
             training_samples.extend(ordered)
     if len(training_samples) < 2:
-        raise ValueError("Calibration requires at least two training samples.")
+        raise ValueError("预校准至少需要两条训练样本。")
     training_payload = payload.model_copy(
         update={"samples": training_samples, "validation_fraction": 0}
     )
@@ -232,6 +232,10 @@ def calibrate_model(payload: ModelCalibrationRequest) -> ModelCalibrationResult:
         else 0.0
     )
     warnings = []
+    warnings.append(
+        "本次拟合使用降阶模型进行预校准；拟合因子必须重新代入完整动态系统，"
+        "并通过独立日期实测数据验证后方可采用。"
+    )
     inhibited_ph_count = sum(
         sample.influent.ph < 5.5 or sample.influent.ph > 9.5
         for sample in training_samples
@@ -291,8 +295,9 @@ def calibrate_model(payload: ModelCalibrationRequest) -> ModelCalibrationResult:
             if validation_objective is not None
             else None
         ),
+        method="降阶模型预校准",
         recommendation=(
-            "用于报告或运行决策前，请在独立日期范围内验证这些因子。"
+            "将候选因子代入完整QSDsan动态系统，并在未参与拟合的独立日期范围内复核。"
         ),
         warnings=warnings,
     )

@@ -38,6 +38,22 @@ export type ProcessParameters = {
   external_carbon_dose_mg_l: number;
   ferric_chloride_dose_mg_l: number;
   tertiary_filter_solids_capture: number;
+  effluent_standard: "grade_a" | "grade_b" | "custom";
+  commissioned_before_2006: boolean;
+  assessment_date: string;
+  operating_data_source: "measured" | "design" | "assumed";
+  advanced_treatment_verified: boolean;
+  independent_validation_passed: boolean;
+};
+
+export type EffluentLimits = {
+  cod_mg_l: number;
+  nh4_n_mg_l: number;
+  tn_mg_l: number;
+  tp_mg_l: number;
+  tss_mg_l: number;
+  basis: string;
+  source: string;
 };
 
 export type SimulationResult = {
@@ -61,6 +77,14 @@ export type SimulationResult = {
     tss_mg_l: number;
   } | null;
   advanced_treatment_applied: boolean;
+  limits: EffluentLimits;
+  reliability: {
+    level: string;
+    score: number;
+    decision: string;
+    checks: Record<string, boolean>;
+    blockers: string[];
+  };
   removal_rates: Record<string, number>;
   energy_kwh_d: number;
   sludge_kg_d: number;
@@ -133,7 +157,12 @@ export const api = {
       })
     });
   },
-  simulate(projectId: string, influent: WaterQuality, parameters: ProcessParameters) {
+  simulate(
+    projectId: string,
+    influent: WaterQuality,
+    parameters: ProcessParameters,
+    customLimits?: EffluentLimits
+  ) {
     type SimulationJob = {
       id: string;
       status: "queued" | "running" | "completed" | "failed";
@@ -142,7 +171,12 @@ export const api = {
     };
     return request<SimulationJob>("/api/simulate/jobs", {
       method: "POST",
-      body: JSON.stringify({ project_id: projectId, influent, parameters })
+      body: JSON.stringify({
+        project_id: projectId,
+        influent,
+        parameters,
+        custom_limits: customLimits
+      })
     }).then(async (job) => {
       for (let attempt = 0; attempt < 180; attempt += 1) {
         const current = attempt === 0
@@ -165,6 +199,7 @@ export const api = {
       validation_objective: number | null;
       improvement_percent: number;
       warnings: string[];
+      method: string;
     }>("/api/calibrate/model", {
       method: "POST",
       body: JSON.stringify({
@@ -193,6 +228,11 @@ export const api = {
       groups: string[];
       samples: CalibrationSample[];
       warnings: string[];
+      quality_score: number;
+      readiness: string;
+      field_coverage: Record<string, number>;
+      duplicate_key_count: number;
+      recommendations: string[];
     }>;
   },
   createReport(
