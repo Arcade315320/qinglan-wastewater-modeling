@@ -8,9 +8,9 @@ from app.services.simulation_service import run_simulation
 def main() -> None:
     payload = json.load(sys.stdin)
     request = SimulationRequest.model_validate(payload)
-    if request.parameters.simulation_days > 30:
+    if request.parameters.simulation_days > 15:
         raise ValueError(
-            "当前免费远程算力最多支持30天动态积分；更长时段需要使用高算力任务。"
+            "当前免费远程算力最多支持15天动态积分；更长时段需要使用高算力任务。"
         )
     result = run_simulation(request)
     json.dump(result.model_dump(mode="json"), sys.stdout, ensure_ascii=False)

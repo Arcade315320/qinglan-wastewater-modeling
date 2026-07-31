@@ -482,12 +482,12 @@ function InputPage({ navigate }: { navigate: (page: PageId) => void }) {
     aerationPower: "15",
     dissolvedOxygen: "2",
     alkalinity: "250",
-    simulationDays: "20"
+    simulationDays: "10"
   });
   const [advancedTreatmentEnabled, setAdvancedTreatmentEnabled] = useState(false);
   const [advancedTreatmentValues, setAdvancedTreatmentValues] = useState({
     externalCarbon: "8",
-    ferricChloride: "18",
+    ferricChloride: "26",
     filterCapture: "85"
   });
   const [runState, setRunState] = useState<"idle" | "saving" | "running" | "error">("idle");
@@ -662,7 +662,7 @@ function InputPage({ navigate }: { navigate: (page: PageId) => void }) {
           ))}
         </div>
         <p className="treatment-note">
-          推荐初始情景为碳源 8、三氯化铁 18 毫克/升、过滤截留率 85%；实际投加量必须通过现场试验校准。
+          推荐初始情景为碳源 8、三氯化铁 26 毫克/升、过滤截留率 85%；实际投加量必须通过现场试验校准。
         </p>
       </section>
       <section className="form-section">
