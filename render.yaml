@@ -12,3 +12,5 @@ services:
         sync: false
       - key: MODAL_AUTH_TOKEN
         sync: false
+      - key: SIMULATION_TIMEOUT_SECONDS
+        value: "290"

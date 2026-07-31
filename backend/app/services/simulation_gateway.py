@@ -13,7 +13,7 @@ def get_simulation_engine_status() -> ModelEngineStatus:
         available=True,
         package="qsdsan/exposan",
         python_version="3.12",
-        detail="完整动态模型已连接至 Modal 远程计算服务（2 GB 内存）。",
+        detail="完整动态模型已连接至 Modal 远程计算服务（4 GB 内存、后台任务模式）。",
     )
 
 
