@@ -25,6 +25,8 @@ PHOSPHORUS_MOLAR_MASS = 30.974
 FERRIC_TO_PHOSPHORUS_MOLAR_RATIO = 1.5
 CHEMICAL_PHOSPHORUS_EFFICIENCY = 0.90
 TERTIARY_FILTER_ENERGY_KWH_M3 = 0.04
+STEADY_STATE_DRIFT_PER_DAY = 0.01
+COMPONENT_MAPPING_TOLERANCE = 0.05
 
 ZONE_FRACTIONS: dict[ProcessType, tuple[float, float, float]] = {
     ProcessType.cas: (0.0, 0.0, 1.0),
@@ -136,7 +138,7 @@ def _fit_bulk_components(
     minimum_fractions: tuple[float, ...] | None = None,
 ) -> bool:
     import numpy as np
-    from scipy.optimize import minimize
+    from scipy.optimize import linprog, minimize
 
     initial = np.array([values.get(key, 0.0) for key in component_ids])
     scales = np.maximum(initial, max(targets[0] * 0.03, 1.0))
@@ -180,9 +182,28 @@ def _fit_bulk_components(
         )
         return float(prior_error + 100.0 * soft_error)
 
+    linear_result = linprog(
+        np.zeros_like(initial),
+        A_ub=(
+            [np.array(phosphorus_coefficients)]
+            if phosphorus_coefficients is not None
+            else None
+        ),
+        b_ub=(
+            [phosphorus_target]
+            if phosphorus_coefficients is not None and phosphorus_target is not None
+            else None
+        ),
+        A_eq=matrix,
+        b_eq=target_vector,
+        bounds=[(float(lower), None) for lower in lower_bounds],
+        method="highs",
+    )
+    if not linear_result.success:
+        return False
     result = minimize(
         objective,
-        initial,
+        linear_result.x,
         method="SLSQP",
         bounds=[(float(lower), None) for lower in lower_bounds],
         constraints=constraints,
@@ -216,7 +237,8 @@ def _bulk_components(payload: SimulationRequest) -> tuple[dict[str, float], str]
             "进水悬浮物与化学需氧量的比值异常低，请确认是否误将出水悬浮物"
             "填入进水栏；若数据无误，请提供实测溶解态和颗粒态模型组分。"
         )
-    organic_n = max(0.0, water.tn_mg_l - water.nh4_n_mg_l)
+    nox_n = (water.nitrate_n_mg_l or 0.0) + (water.nitrite_n_mg_l or 0.0)
+    organic_n = max(0.0, water.tn_mg_l - water.nh4_n_mg_l - nox_n)
     alkalinity = payload.parameters.alkalinity_mg_l_caco3 / 50 * 12
     if payload.parameters.model_type == ModelType.asm1:
         soluble_biodegradable = min(
@@ -232,6 +254,7 @@ def _bulk_components(payload: SimulationRequest) -> tuple[dict[str, float], str]
             "X_BH": active_biomass,
             "S_NH": water.nh4_n_mg_l,
             "S_ALK": alkalinity,
+            "S_NO": nox_n,
         }
         fitted = _fit_bulk_components(
             values,
@@ -255,14 +278,30 @@ def _bulk_components(payload: SimulationRequest) -> tuple[dict[str, float], str]
             else "按默认比例自动组分化"
         )
     else:
-        soluble_biodegradable = min(
-            cod * 0.35,
-            (water.bod_mg_l / 0.65) if water.bod_mg_l is not None else cod * 0.25,
+        measured_soluble = water.soluble_cod_mg_l
+        soluble_inert = min(
+            cod * 0.05,
+            measured_soluble * 0.5 if measured_soluble is not None else cod * 0.05,
         )
-        acetate = soluble_biodegradable * 0.40
+        soluble_biodegradable = (
+            max(0.0, measured_soluble - soluble_inert)
+            if measured_soluble is not None
+            else min(
+                cod * 0.35,
+                (water.bod_mg_l / 0.65)
+                if water.bod_mg_l is not None
+                else cod * 0.25,
+            )
+        )
+        acetate = min(
+            soluble_biodegradable,
+            water.vfa_as_cod_mg_l
+            if water.vfa_as_cod_mg_l is not None
+            else soluble_biodegradable * 0.40,
+        )
         active_biomass = cod * 0.05
         values = {
-            "S_I": cod * 0.05,
+            "S_I": soluble_inert,
             "S_F": soluble_biodegradable - acetate,
             "S_A": acetate,
             "X_I": cod * 0.13,
@@ -270,6 +309,7 @@ def _bulk_components(payload: SimulationRequest) -> tuple[dict[str, float], str]
             "X_H": active_biomass,
             "S_NH4": water.nh4_n_mg_l,
             "S_ALK": alkalinity,
+            "S_NO3": nox_n,
         }
         fitted = _fit_bulk_components(
             values,
@@ -285,7 +325,6 @@ def _bulk_components(payload: SimulationRequest) -> tuple[dict[str, float], str]
             soft_targets=(organic_n,),
             phosphorus_coefficients=(0.0, 0.01, 0.0, 0.01, 0.01, 0.02),
             phosphorus_target=water.tp_mg_l,
-            minimum_fractions=(0.5, 0.25, 0.25, 0.5, 0.0, 0.5),
         )
         inherent_p = (
             values["S_F"] * 0.01
@@ -293,12 +332,41 @@ def _bulk_components(payload: SimulationRequest) -> tuple[dict[str, float], str]
             + values["X_S"] * 0.01
             + values["X_H"] * 0.02
         )
-        values["S_PO4"] = max(0.0, water.tp_mg_l - inherent_p)
+        inherent_organic_n = (
+            values["S_I"] * 0.01
+            + values["S_F"] * 0.03
+            + values["X_I"] * 0.02
+            + values["X_S"] * 0.04
+            + values["X_H"] * 0.07
+        )
+        inferred_oxidized_n = (
+            water.nitrate_n_mg_l is None and water.nitrite_n_mg_l is None
+        )
+        if inferred_oxidized_n:
+            values["S_NO3"] += max(0.0, organic_n - inherent_organic_n)
+        values["S_PO4"] = (
+            water.orthophosphate_p_mg_l
+            if water.orthophosphate_p_mg_l is not None
+            else max(0.0, water.tp_mg_l - inherent_p)
+        )
         mapping_method = (
-            "按化学需氧量、总氮、总磷和悬浮物约束自动组分化"
+            "按实测溶解组分及化学需氧量、总氮、总磷和悬浮物约束组分化"
+            if any(
+                value is not None
+                for value in (
+                    water.soluble_cod_mg_l,
+                    water.vfa_as_cod_mg_l,
+                    water.nitrate_n_mg_l,
+                    water.nitrite_n_mg_l,
+                    water.orthophosphate_p_mg_l,
+                )
+            )
+            else "按化学需氧量、总氮、总磷和悬浮物约束自动组分化"
             if fitted
             else "按默认比例自动组分化"
         )
+        if inferred_oxidized_n:
+            mapping_method += "；未测氧化态氮按总氮差额估算"
     return values, mapping_method
 
 
@@ -342,26 +410,39 @@ def _temporary_bsm_configuration(payload: SimulationRequest):
 
     params = payload.parameters
     flow = payload.influent.flow_m3_d
-    _, anoxic, aerobic = ZONE_FRACTIONS[params.process_type]
-    unaerated = max(0.02, 1.0 - aerobic)
-    total_volume = flow * params.hrt_h / 24.0
+    anaerobic_fraction, anoxic_fraction, aerobic_fraction = ZONE_FRACTIONS[params.process_type]
+    total_volume = params.reactor_volume_m3 or flow * params.hrt_h / 24.0
+    if params.anaerobic_volume_m3 is not None:
+        anaerobic_volume = params.anaerobic_volume_m3
+        anoxic_volume = params.anoxic_volume_m3 or 0.0
+        aerobic_volume = params.aerobic_volume_m3 or 0.0
+    else:
+        anaerobic_volume = total_volume * anaerobic_fraction
+        anoxic_volume = total_volume * anoxic_fraction
+        aerobic_volume = total_volume * aerobic_fraction
+    unaerated_volume = anaerobic_volume + anoxic_volume
     count_unaerated = 2 if params.model_type == ModelType.asm1 else 4
     values = {
         "Q": flow,
         "Q_ras": flow * params.sludge_recycle_ratio,
         "Q_intr": flow * params.internal_recycle_ratio,
-        "Q_was": min(
-            flow * 0.08,
-            flow / max(params.srt_d * 5.3, 1.0),
+        "Q_was": params.waste_sludge_flow_m3_d or min(
+            flow * 0.08, flow / max(params.srt_d * 5.3, 1.0)
         ),
-        "V_an": total_volume * unaerated / count_unaerated,
-        "V_ae": total_volume * max(aerobic, 0.02) / 3,
+        "V_an": max(1.0, unaerated_volume / count_unaerated),
+        "V_ae": max(1.0, aerobic_volume / 3),
     }
     original = {name: getattr(bsm, name) for name in values}
     try:
         for name, value in values.items():
             setattr(bsm, name, value)
-        yield bsm, values
+        yield bsm, {
+            **values,
+            "total_volume": total_volume,
+            "anaerobic_volume": anaerobic_volume,
+            "anoxic_volume": anoxic_volume,
+            "aerobic_volume": aerobic_volume,
+        }
     finally:
         for name, value in original.items():
             setattr(bsm, name, value)
@@ -459,7 +540,7 @@ def _apply_advanced_treatment(
     )
 
 
-def _integration_converged(system, simulation_days: float) -> bool:
+def _integration_state_drift(system, simulation_days: float) -> float | None:
     import numpy as np
 
     solution = getattr(getattr(system, "scope", None), "sol", None)
@@ -469,7 +550,7 @@ def _integration_converged(system, simulation_days: float) -> bool:
         or len(solution.t) < 2
         or solution.t[-1] < simulation_days - 1e-6
     ):
-        return False
+        return None
     window_start = max(0.0, simulation_days - min(1.0, simulation_days * 0.1))
     start_index = int(np.searchsorted(solution.t, window_start, side="right") - 1)
     start_index = max(0, min(start_index, len(solution.t) - 2))
@@ -480,10 +561,91 @@ def _integration_converged(system, simulation_days: float) -> bool:
         np.abs(final_state), 1.0
     )
     finite_drift = relative_drift[np.isfinite(relative_drift)]
-    return bool(
-        finite_drift.size
-        and np.percentile(finite_drift, 95) / elapsed <= 1e-3
+    if not finite_drift.size:
+        return None
+    return float(np.percentile(finite_drift, 95) / elapsed)
+
+
+def _integration_converged(system, simulation_days: float) -> bool:
+    drift = _integration_state_drift(system, simulation_days)
+    return drift is not None and drift <= STEADY_STATE_DRIFT_PER_DAY
+
+
+def _oxygen_saturation_mg_l(temperature_c: float) -> float:
+    temperature = max(0.0, min(40.0, temperature_c))
+    return (
+        14.652
+        - 0.41022 * temperature
+        + 0.007991 * temperature**2
+        - 0.000077774 * temperature**3
     )
+
+
+def _oxygen_transfer_diagnostics(
+    payload: SimulationRequest, config: dict[str, float]
+) -> dict[str, float | bool]:
+    params = payload.parameters
+    aerobic_volume = max(config["aerobic_volume"], 1.0)
+    driving_force = max(
+        0.5,
+        _oxygen_saturation_mg_l(payload.influent.temperature_c)
+        - params.aerobic_do_mg_l,
+    )
+    capacity = (
+        params.aeration_power_kw
+        * params.aeration_hours_d
+        * params.oxygen_transfer_efficiency_kg_o2_kwh
+    )
+    power_limited_kla = capacity * 1000 / (aerobic_volume * driving_force)
+    requested_kla = params.aerobic_kla_d or power_limited_kla
+    effective_kla = max(0.0, min(requested_kla, power_limited_kla))
+    requested_oxygen = requested_kla * aerobic_volume * driving_force / 1000
+    return {
+        "effective_kla_d": effective_kla,
+        "power_limited_kla_d": power_limited_kla,
+        "oxygen_transfer_capacity_kg_d": capacity,
+        "requested_oxygen_transfer_kg_d": requested_oxygen,
+        "oxygen_transfer_sufficient": capacity + 1e-9 >= requested_oxygen * 0.95,
+    }
+
+
+def _simulation_horizons(payload: SimulationRequest) -> list[float]:
+    params = payload.parameters
+    horizons = [params.simulation_days]
+    if not params.auto_convergence:
+        return horizons
+    while horizons[-1] < params.max_simulation_days:
+        horizons.append(min(params.max_simulation_days, horizons[-1] + 30.0))
+    return horizons
+
+
+def _configure_reactor(system, payload: SimulationRequest, config: dict[str, float]) -> None:
+    """Apply process-specific zone volumes, recycle location and measured oxygen transfer."""
+    params = payload.parameters
+    effective_kla = config.get(
+        "effective_kla_d", params.aerobic_kla_d or 0.0
+    )
+    if params.model_type == ModelType.asm2d:
+        import numpy as np
+
+        reactor = system.flowsheet.unit.AS
+        anaerobic = config["anaerobic_volume"]
+        anoxic = config["anoxic_volume"]
+        aerobic = config["aerobic_volume"]
+        reactor.V_tanks = np.asarray(
+            [max(1.0, anaerobic / 2)] * 2
+            + [max(1.0, anoxic / 2)] * 2
+            + [max(1.0, aerobic / 3)] * 3,
+            dtype=float,
+        )
+        recycle_destination = 2 if params.process_type == ProcessType.aao else 0
+        reactor.internal_recycles = [(6, recycle_destination, config["Q_intr"])]
+        reactor.kLa = np.asarray([0.0] * 4 + [effective_kla] * 3)
+        return
+
+    for unit_id, fraction in (("O1", 1.0), ("O2", 1.0), ("O3", 0.35)):
+        unit = getattr(system.flowsheet.unit, unit_id)
+        unit.aeration.KLa = effective_kla * fraction
 
 
 def run_dynamic_system(
@@ -498,6 +660,7 @@ def run_dynamic_system(
     bool,
     list[str],
     list[str],
+    dict[str, float | int | bool | None],
 ]:
     _require_dynamic_memory()
     if payload.parameters.model_type not in (ModelType.asm1, ModelType.asm2d):
@@ -507,11 +670,26 @@ def run_dynamic_system(
     params = payload.parameters
     water = payload.influent
     with _MODEL_LOCK, _temporary_bsm_configuration(payload) as (bsm, config):
+        oxygen_diagnostics = _oxygen_transfer_diagnostics(payload, config)
+        config.update(oxygen_diagnostics)
         settler = dict(
             bsm.default_c1_kwargs,
             underflow=config["Q_ras"],
             wastage=config["Q_was"],
-            surface_area=max(80.0, water.flow_m3_d / 12.3),
+            surface_area=(
+                params.clarifier_surface_area_m2
+                or max(80.0, water.flow_m3_d / 12.3)
+            ),
+            height=params.clarifier_depth_m or bsm.default_c1_kwargs["height"],
+            X_threshold=(
+                params.settler_tss_threshold_mg_l
+                or bsm.default_c1_kwargs["X_threshold"]
+            ),
+            v_max=params.settler_v_max_m_d or bsm.default_c1_kwargs["v_max"],
+            v_max_practical=(
+                params.settler_v_max_practical_m_d
+                or bsm.default_c1_kwargs["v_max_practical"]
+            ),
         )
         system = bsm.create_system(
             suspended_growth_model=params.model_type.value,
@@ -525,22 +703,36 @@ def run_dynamic_system(
             asm_kwargs=_kinetic_kwargs(payload),
             settler_kwargs=settler,
         )
+        _configure_reactor(system, payload, config)
         influent = system.flowsheet.stream.wastewater
         influent.T = water.temperature_c + 273.15
-        try:
-            final_window_start = max(0.0, params.simulation_days - 1.0)
-            system.simulate(
-                state_reset_hook="reset_cache",
-                t_span=(0, params.simulation_days),
-                t_eval=(final_window_start, params.simulation_days),
-                method="LSODA",
-            )
-        except (ArithmeticError, RuntimeError, ValueError) as error:
-            raise ValueError(
-                "动态积分未能完成，请检查进水负荷、温度、停留时间、回流比和组分数据。"
-            ) from error
-        integration_converged = _integration_converged(
-            system, params.simulation_days
+        state_drift_per_d = None
+        actual_simulation_days = params.simulation_days
+        convergence_attempts = 0
+        for horizon in _simulation_horizons(payload):
+            convergence_attempts += 1
+            try:
+                final_window_start = max(0.0, horizon - 1.0)
+                system.simulate(
+                    state_reset_hook="reset_cache",
+                    t_span=(0, horizon),
+                    t_eval=(final_window_start, horizon),
+                    method="LSODA",
+                )
+            except (ArithmeticError, RuntimeError, ValueError) as error:
+                raise ValueError(
+                    "动态积分未能完成，请检查进水负荷、温度、停留时间、回流比和组分数据。"
+                ) from error
+            actual_simulation_days = horizon
+            state_drift_per_d = _integration_state_drift(system, horizon)
+            if (
+                state_drift_per_d is not None
+                and state_drift_per_d <= params.convergence_tolerance_per_d
+            ):
+                break
+        integration_converged = (
+            state_drift_per_d is not None
+            and state_drift_per_d <= params.convergence_tolerance_per_d
         )
         solution = getattr(getattr(system, "scope", None), "sol", None)
         if solution is None or not solution.success:
@@ -549,13 +741,14 @@ def run_dynamic_system(
             )
         effluent = system.flowsheet.stream.effluent
         was = system.flowsheet.stream.WAS
+        ras = system.flowsheet.stream.RAS
 
         cod = float(effluent.COD)
         tss = float(effluent.get_TSS())
         tn = float(_safe_composite(effluent, "N") or 0.0)
         if params.model_type == ModelType.asm1:
             ammonium = _stream_concentration(effluent, "S_NH")
-            tp = water.tp_mg_l * min(1.0, tss / max(water.tss_mg_l, 1e-9))
+            tp = 0.0
         else:
             ammonium = _stream_concentration(effluent, "S_NH4")
             tp = float(_safe_composite(effluent, "P") or 0.0)
@@ -582,15 +775,18 @@ def run_dynamic_system(
         reconstructed = {
             "cod_mg_l": round(float(influent.COD), 4),
             "tn_mg_l": round(float(_safe_composite(influent, "N") or 0.0), 4),
-            "tp_mg_l": round(float(_safe_composite(influent, "P") or 0.0), 4),
             "tss_mg_l": round(float(influent.get_TSS()), 4),
         }
         targets = {
             "cod_mg_l": water.cod_mg_l,
             "tn_mg_l": water.tn_mg_l,
-            "tp_mg_l": water.tp_mg_l,
             "tss_mg_l": water.tss_mg_l,
         }
+        if params.model_type == ModelType.asm2d:
+            reconstructed["tp_mg_l"] = round(
+                float(_safe_composite(influent, "P") or 0.0), 4
+            )
+            targets["tp_mg_l"] = water.tp_mg_l
         residuals = {
             key: round(
                 (reconstructed[key] - target) / max(abs(target), 1.0),
@@ -638,11 +834,10 @@ def run_dynamic_system(
                 "末端尚未达到准稳态，表观回收受系统内物质累积或释放影响，仅供诊断。"
             )
         if params.model_type == ModelType.asm1:
-            balance_notes.append("ASM1不含磷组分，总磷按随出水固体夹带估算。")
+            balance_notes.append("活性污泥模型一不含磷组分，总磷不参与重构和守恒判定。")
         mapping_ok = all(
-            abs(value) <= 0.15
-            for key, value in residuals.items()
-            if not (params.model_type == ModelType.asm1 and key == "tp_mg_l")
+            abs(value) <= COMPONENT_MAPPING_TOLERANCE
+            for value in residuals.values()
         )
         recovery_ok = (
             cod_recovery <= MASS_RECOVERY_UPPER_BOUND
@@ -667,22 +862,62 @@ def run_dynamic_system(
                 if phosphorus_recovery is not None
                 else None
             ),
+            state_drift_per_d=(
+                round(state_drift_per_d, 8)
+                if state_drift_per_d is not None
+                else None
+            ),
             notes=balance_notes,
         )
         sludge_kg_d = float(was.get_TSS()) * q_was / 1000 + advanced_sludge_kg_d
-        energy_kwh_d = params.aeration_power_kw * 24 + advanced_energy_kwh_d
+        energy_kwh_d = (
+            params.aeration_power_kw * params.aeration_hours_d
+            + params.mixing_power_kw * 24
+            + params.pumping_power_kw * 24
+            + advanced_energy_kwh_d
+        )
         convergence_reached = (
             hydraulic_error <= 1e-5
             and integration_converged
         )
         warnings = []
+        if "氧化态氮按总氮差额估算" in mapping_method:
+            warnings.append(
+                "未提供硝态氮和亚硝态氮，模型为闭合总氮采用了差额估算；"
+                "工程复核必须用实测氧化态氮替换。"
+            )
         specific_aeration_energy = (
-            params.aeration_power_kw * 24 / max(water.flow_m3_d, 1e-9)
+            params.aeration_power_kw * params.aeration_hours_d
+            / max(water.flow_m3_d, 1e-9)
         )
-        warnings.append(
-            "好氧池溶解氧当前作为运行目标记录；QSDsan动态反应器仍采用基准传氧系数，"
-            "尚未由该数值反算现场传氧系数。"
-        )
+        if params.aerobic_kla_d is None:
+            warnings.append(
+                f"未填写现场传氧系数，已根据曝气功率和氧转移效率计算有效传氧系数"
+                f"{config['effective_kla_d']:.2f}/天。"
+            )
+        else:
+            warnings.append(
+                f"现场传氧系数为{params.aerobic_kla_d:.1f}/天，"
+                f"受当前曝气功率约束后的有效值为{config['effective_kla_d']:.2f}/天。"
+            )
+        if not config["oxygen_transfer_sufficient"]:
+            warnings.append(
+                "录入曝气功率不足以支持现场传氧系数，模型已按可用供氧能力限制传氧。"
+            )
+        if params.waste_sludge_flow_m3_d is None:
+            warnings.append("未填写现场排泥流量，排泥量仍由目标污泥龄估算。")
+        if params.clarifier_surface_area_m2 is None:
+            warnings.append("未填写二沉池总表面积，当前按基准表面水力负荷估算。")
+        if any(
+            value is None
+            for value in (
+                params.clarifier_depth_m,
+                params.settler_v_max_m_d,
+                params.settler_v_max_practical_m_d,
+                params.settler_tss_threshold_mg_l,
+            )
+        ):
+            warnings.append("二沉池沉降曲线参数不完整，当前仍包含基准沉降参数。")
         if specific_aeration_energy < 0.05:
             warnings.append(
                 f"录入曝气功率对应单位水量能耗仅{specific_aeration_energy:.3f}"
@@ -690,7 +925,7 @@ def run_dynamic_system(
                 "请用鼓风机实测总功率和运行时长复核。"
             )
         if not mapping_ok:
-            warnings.append("总量到模型组分的重构偏差超过15%，请补充实测组分数据。")
+            warnings.append("总量到模型组分的重构偏差超过5%，请补充实测分项组分数据。")
         if not recovery_ok:
             if integration_converged:
                 warnings.append("稳态下表观物质回收超过103%，请检查进水组分和模型参数。")
@@ -700,11 +935,58 @@ def run_dynamic_system(
             if hydraulic_error <= 1e-5:
                 warnings.append(
                     "水力闭合已通过，但末端状态漂移仍超过阈值；"
-                    "请延长积分时长或检查初始污泥浓度、负荷和回流参数。"
+                    f"当前为{(state_drift_per_d or 0) * 100:.3f}%/天，"
+                    f"阈值为{params.convergence_tolerance_per_d * 100:.1f}%/天。"
+                    f"程序已自动积分至{actual_simulation_days:.0f}天；"
+                    "请检查初始污泥浓度、负荷和回流参数。"
                 )
             else:
                 warnings.append("水力闭合未通过，尚不能判定为稳态。")
         warnings.extend(advanced_warnings)
+        clarifier_surface_overflow = water.flow_m3_d / settler["surface_area"]
+        if clarifier_surface_overflow > 35:
+            warnings.append(
+                f"二沉池表面水力负荷为{clarifier_surface_overflow:.2f}米/天，"
+                "请核查高峰流量下的污泥流失风险。"
+            )
+        predicted_ras_tss = float(ras.get_TSS())
+        return_sludge_relative_error = None
+        if params.return_sludge_tss_mg_l is not None:
+            return_sludge_relative_error = abs(
+                predicted_ras_tss - params.return_sludge_tss_mg_l
+            ) / params.return_sludge_tss_mg_l
+            if return_sludge_relative_error > 0.25:
+                warnings.append(
+                    "二沉池预测回流污泥浓度与实测值偏差超过25%，"
+                    "需要校准沉降速度和临界污泥浓度。"
+                )
+        estimated_srt = None
+        if (
+            params.mixed_liquor_tss_mg_l is not None
+            and params.waste_sludge_tss_mg_l is not None
+            and params.waste_sludge_flow_m3_d is not None
+        ):
+            solids_inventory = (
+                config["total_volume"] * params.mixed_liquor_tss_mg_l
+            )
+            solids_discharge = (
+                params.waste_sludge_flow_m3_d * params.waste_sludge_tss_mg_l
+                + q_eff * tss
+            )
+            estimated_srt = solids_inventory / max(solids_discharge, 1e-9)
+        diagnostics = {
+            "actual_simulation_days": actual_simulation_days,
+            "convergence_attempts": convergence_attempts,
+            "effective_kla_d": config["effective_kla_d"],
+            "oxygen_transfer_capacity_kg_d": config[
+                "oxygen_transfer_capacity_kg_d"
+            ],
+            "oxygen_transfer_sufficient": config["oxygen_transfer_sufficient"],
+            "estimated_srt_d": estimated_srt,
+            "clarifier_surface_overflow_m_d": clarifier_surface_overflow,
+            "predicted_return_sludge_tss_mg_l": predicted_ras_tss,
+            "return_sludge_relative_error": return_sludge_relative_error,
+        }
         return (
             prediction,
             biological_prediction,
@@ -715,4 +997,5 @@ def run_dynamic_system(
             convergence_reached,
             advanced_assumptions,
             warnings,
+            diagnostics,
         )

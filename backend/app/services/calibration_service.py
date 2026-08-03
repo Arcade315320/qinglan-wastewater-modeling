@@ -82,10 +82,13 @@ def _predictions(
                 parameters=parameters,
             )
         )
+        measured = sample.measured.model_dump()
+        if parameters.model_type.value == "ASM1":
+            measured["tp_mg_l"] = None
         rows.append(
             (
                 result.effluent.model_dump(),
-                sample.measured.model_dump(),
+                measured,
             )
         )
     return rows
@@ -264,6 +267,7 @@ def calibrate_model(payload: ModelCalibrationRequest) -> ModelCalibrationResult:
             "校准后的归一化目标函数改善不足10%，不得将本次拟合视为已验证。"
         )
     validation_objective = None
+    validation_passed = False
     if validation_samples:
         validation_payload = payload.model_copy(
             update={"samples": validation_samples, "validation_fraction": 0}
@@ -271,13 +275,19 @@ def calibrate_model(payload: ModelCalibrationRequest) -> ModelCalibrationResult:
         validation_objective = _objective_from_rows(
             _predictions(validation_payload, factors)
         )
+        validation_passed = (
+            len(validation_samples) >= 2
+            and validation_objective <= 0.2
+            and validation_objective <= best_objective * 1.5
+        )
         if validation_objective > best_objective * 1.5:
             warnings.append(
                 "验证误差比训练误差高出50%以上，拟合参数可能不适用于后续日期。"
             )
     else:
         warnings.append(
-            "未建立独立验证时段；每座污水厂至少需要五条连续日期样本。"
+            "未建立独立验证时段；每座污水厂至少需要五条连续日期样本，"
+            "且全部分组合计至少保留两条不参与拟合。"
         )
     return ModelCalibrationResult(
         project_id=payload.project_id,
@@ -295,6 +305,7 @@ def calibrate_model(payload: ModelCalibrationRequest) -> ModelCalibrationResult:
             if validation_objective is not None
             else None
         ),
+        validation_passed=validation_passed,
         method="降阶模型预校准",
         recommendation=(
             "将候选因子代入完整QSDsan动态系统，并在未参与拟合的独立日期范围内复核。"

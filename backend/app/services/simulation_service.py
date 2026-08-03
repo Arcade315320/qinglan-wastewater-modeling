@@ -54,6 +54,16 @@ DYNAMIC_SUPPORTED_PROCESSES = {
 }
 
 
+def _applicable_indicators(model: ModelType) -> dict[str, bool]:
+    return {
+        "cod": True,
+        "nh4_n": True,
+        "tn": True,
+        "tp": model != ModelType.asm1,
+        "tss": True,
+    }
+
+
 def _clip(value: float, lower: float = 0.0, upper: float = 1.0) -> float:
     return max(lower, min(upper, value))
 
@@ -102,6 +112,7 @@ def _assess_reliability(
     mass_balance,
     convergence_reached: bool,
     advanced_treatment_applied: bool,
+    diagnostics: dict,
 ) -> ReliabilityAssessment:
     relevant_residuals = [
         abs(value)
@@ -111,31 +122,74 @@ def _assess_reliability(
             and key == "tp_mg_l"
         )
     ]
+    water = payload.influent
+    params = payload.parameters
+    fractionation_fields = (
+        water.soluble_cod_mg_l,
+        water.nitrate_n_mg_l,
+        water.nitrite_n_mg_l,
+    ) + (
+        (water.vfa_as_cod_mg_l, water.orthophosphate_p_mg_l)
+        if params.model_type == ModelType.asm2d
+        else ()
+    )
+    measured_fractionation = payload.component_concentrations is not None or all(
+        value is not None for value in fractionation_fields
+    )
+    measured_operations = (
+        params.operating_data_source == OperatingDataSource.measured
+        and params.reactor_volume_m3 is not None
+        and params.waste_sludge_flow_m3_d is not None
+        and params.mixed_liquor_tss_mg_l is not None
+        and params.waste_sludge_tss_mg_l is not None
+    )
+    measured_settler = all(
+        value is not None
+        for value in (
+            params.clarifier_surface_area_m2,
+            params.clarifier_depth_m,
+            params.settler_v_max_m_d,
+            params.settler_v_max_practical_m_d,
+            params.settler_tss_threshold_mg_l,
+        )
+    ) and (
+        diagnostics.get("return_sludge_relative_error") is not None
+        and diagnostics["return_sludge_relative_error"] <= 0.25
+    )
     checks = {
-        "组分重构": max(relevant_residuals, default=0) <= 0.15,
+        "组分重构": max(relevant_residuals, default=0) <= 0.05,
         "水力闭合": mass_balance.hydraulic_relative_error <= 1e-5,
         "动态稳态": convergence_reached,
-        "实测模型组分": payload.component_concentrations is not None,
-        "同期实测运行参数": (
-            payload.parameters.operating_data_source
-            == OperatingDataSource.measured
-        ),
-        "独立时段验证": payload.parameters.independent_validation_passed,
+        "实测模型组分": measured_fractionation,
+        "同期实测运行参数": measured_operations,
+        "供氧能力一致": bool(diagnostics.get("oxygen_transfer_sufficient")),
+        "二沉池实测校准": measured_settler,
+        "独立时段验证": params.independent_validation_passed,
         "强化处理现场核实": (
             not advanced_treatment_applied
             or payload.parameters.advanced_treatment_verified
         ),
     }
     weights = {
-        "组分重构": 15,
-        "水力闭合": 15,
+        "组分重构": 10,
+        "水力闭合": 10,
         "动态稳态": 15,
         "实测模型组分": 15,
         "同期实测运行参数": 15,
-        "独立时段验证": 15,
-        "强化处理现场核实": 10,
+        "供氧能力一致": 10,
+        "二沉池实测校准": 10,
+        "独立时段验证": 10,
+        "强化处理现场核实": 5,
     }
     score = sum(weight for name, weight in weights.items() if checks[name])
+    critical_evidence = (
+        checks["动态稳态"],
+        checks["实测模型组分"],
+        checks["同期实测运行参数"],
+        checks["独立时段验证"],
+    )
+    if not all(critical_evidence):
+        score = min(score, 30)
     blockers = [name for name, passed in checks.items() if not passed]
     if score == 100:
         level = "工程复核"
@@ -316,9 +370,15 @@ def _run_activated_sludge_screening(payload: SimulationRequest) -> SimulationRes
         )
         solids_p_fraction = 0.10 * effective_solids_capture
         p_removal_fraction = _clip(biological_p_fraction + solids_p_fraction, upper=0.92)
-    else:
+    elif model == ModelType.asm2d:
         p_removal_fraction = 0.18 * effective_solids_capture
-    tp_effluent = influent.tp_mg_l * (1.0 - p_removal_fraction)
+    else:
+        p_removal_fraction = 0.0
+    tp_effluent = (
+        influent.tp_mg_l * (1.0 - p_removal_fraction)
+        if model != ModelType.asm1
+        else 0.0
+    )
 
     tss_effluent = influent.tss_mg_l * (1.0 - effective_solids_capture)
     if params.process_type == ProcessType.mbr:
@@ -335,7 +395,11 @@ def _run_activated_sludge_screening(payload: SimulationRequest) -> SimulationRes
         cod=_removal(influent.cod_mg_l, effluent.cod_mg_l),
         nh4_n=_removal(influent.nh4_n_mg_l, effluent.nh4_n_mg_l),
         tn=_removal(influent.tn_mg_l, effluent.tn_mg_l),
-        tp=_removal(influent.tp_mg_l, effluent.tp_mg_l),
+        tp=(
+            _removal(influent.tp_mg_l, effluent.tp_mg_l)
+            if model != ModelType.asm1
+            else 0.0
+        ),
         tss=_removal(influent.tss_mg_l, effluent.tss_mg_l),
     )
 
@@ -343,8 +407,11 @@ def _run_activated_sludge_screening(payload: SimulationRequest) -> SimulationRes
         "Bulk COD was fractionated with default assumptions: 5% soluble inert and 13% particulate inert.",
         "No plant-specific kinetic calibration or measured secondary-settler profile has been applied.",
     ]
-    if model == ModelType.asm1 and params.process_type in P_REMOVAL_PROCESSES:
-        warnings.append("ASM1 does not represent PAO/PHA/PP processes; phosphorus removal is solids-only.")
+    if model == ModelType.asm1:
+        warnings.append(
+            "活性污泥模型一不包含磷过程，总磷不参与预测、校准和达标判定；"
+            "需要评价总磷时请改用活性污泥模型二d或独立除磷模型。"
+        )
     if influent.bod_mg_l is None:
         warnings.append("BOD was not supplied; 55% of COD was used as a biodegradable-carbon proxy.")
     if heterotroph_ph_activity < 0.5 or nitrifier_ph_activity < 0.5:
@@ -376,7 +443,12 @@ def _run_activated_sludge_screening(payload: SimulationRequest) -> SimulationRes
             blockers=["完整动态系统", "实测模型组分", "独立时段验证"],
         ),
         removal_rates=removal,
-        energy_kwh_d=round(params.aeration_power_kw * 24, 2),
+        energy_kwh_d=round(
+            params.aeration_power_kw * params.aeration_hours_d
+            + params.mixing_power_kw * 24
+            + params.pumping_power_kw * 24,
+            2,
+        ),
         sludge_kg_d=round(
             influent.flow_m3_d
             * max(0.0, influent.tss_mg_l - effluent.tss_mg_l)
@@ -387,13 +459,19 @@ def _run_activated_sludge_screening(payload: SimulationRequest) -> SimulationRes
             "cod": effluent.cod_mg_l <= limits.cod_mg_l,
             "nh4_n": effluent.nh4_n_mg_l <= limits.nh4_n_mg_l,
             "tn": effluent.tn_mg_l <= limits.tn_mg_l,
-            "tp": effluent.tp_mg_l <= limits.tp_mg_l,
+            "tp": False if model == ModelType.asm1 else effluent.tp_mg_l <= limits.tp_mg_l,
             "tss": effluent.tss_mg_l <= limits.tss_mg_l,
         },
+        applicable_indicators=_applicable_indicators(model),
+        compliance_valid=False,
         model_note=(
-            "Fast screening calculation based on QSDsan/IWA ASM kinetic defaults. "
-            "Production decisions require the full QSDsan dynamic system and calibration "
-            "against plant influent/effluent time series."
+            "降阶筛选采用QSDsan与国际水协活性污泥模型动力学默认值；"
+            "工程结论必须使用完整动态系统和污水厂实测时序数据校准。"
+            + (
+                "活性污泥模型一不包含磷过程，本次总磷不适用。"
+                if model == ModelType.asm1
+                else ""
+            )
         ),
         component_mapping=ComponentMappingResult(
             method="降阶模型默认组分比例",
@@ -441,6 +519,7 @@ def run_simulation(payload: SimulationRequest) -> SimulationResult:
         convergence_reached,
         advanced_assumptions,
         warnings,
+        diagnostics,
     ) = run_dynamic_system(payload)
     influent = payload.influent
     reactor_model = (
@@ -450,7 +529,11 @@ def run_simulation(payload: SimulationRequest) -> SimulationResult:
         cod=_removal(influent.cod_mg_l, effluent.cod_mg_l),
         nh4_n=_removal(influent.nh4_n_mg_l, effluent.nh4_n_mg_l),
         tn=_removal(influent.tn_mg_l, effluent.tn_mg_l),
-        tp=_removal(influent.tp_mg_l, effluent.tp_mg_l),
+        tp=(
+            _removal(influent.tp_mg_l, effluent.tp_mg_l)
+            if payload.parameters.model_type != ModelType.asm1
+            else 0.0
+        ),
         tss=_removal(influent.tss_mg_l, effluent.tss_mg_l),
     )
     limits = _resolve_limits(payload)
@@ -465,6 +548,7 @@ def run_simulation(payload: SimulationRequest) -> SimulationResult:
         mass_balance,
         convergence_reached,
         advanced_treatment_applied,
+        diagnostics,
     )
     if (
         advanced_treatment_applied
@@ -473,6 +557,11 @@ def run_simulation(payload: SimulationRequest) -> SimulationResult:
         warnings.append(
             "强化处理尚未标记为现场核实，本次最终出水只能作为方案情景，"
             "不能作为污水厂实际出水结论。"
+        )
+    if payload.parameters.model_type == ModelType.asm1:
+        warnings.append(
+            "活性污泥模型一不包含磷过程，总磷不参与预测、校准和达标判定；"
+            "需要评价总磷时请改用活性污泥模型二d或独立除磷模型。"
         )
     return SimulationResult(
         project_id=payload.project_id,
@@ -493,22 +582,69 @@ def run_simulation(payload: SimulationRequest) -> SimulationResult:
             "cod": effluent.cod_mg_l <= limits.cod_mg_l,
             "nh4_n": effluent.nh4_n_mg_l <= limits.nh4_n_mg_l,
             "tn": effluent.tn_mg_l <= limits.tn_mg_l,
-            "tp": effluent.tp_mg_l <= limits.tp_mg_l,
+            "tp": (
+                False
+                if payload.parameters.model_type == ModelType.asm1
+                else effluent.tp_mg_l <= limits.tp_mg_l
+            ),
             "tss": effluent.tss_mg_l <= limits.tss_mg_l,
         },
+        applicable_indicators=_applicable_indicators(payload.parameters.model_type),
+        compliance_valid=(
+            convergence_reached
+            and mass_balance.passed
+            and reliability.score == 100
+        ),
         model_note=(
             "由QSDsan分段动态反应器、内回流、污泥回流和十层二沉池组成；"
             "启用强化处理时叠加后置反硝化、化学除磷和三级过滤工程计算；"
             "自动组分化结果必须结合实测组分和独立时段校准复核。"
+            + (
+                "活性污泥模型一不包含磷过程，本次总磷不适用。"
+                if payload.parameters.model_type == ModelType.asm1
+                else ""
+            )
         ),
         component_mapping=mapping,
         mass_balance=mass_balance,
         convergence_reached=convergence_reached,
-        simulation_days=payload.parameters.simulation_days,
+        simulation_days=float(diagnostics["actual_simulation_days"]),
+        requested_simulation_days=payload.parameters.simulation_days,
+        convergence_attempts=int(diagnostics["convergence_attempts"]),
+        effective_kla_d=float(diagnostics["effective_kla_d"]),
+        oxygen_transfer_capacity_kg_d=float(
+            diagnostics["oxygen_transfer_capacity_kg_d"]
+        ),
+        estimated_srt_d=(
+            float(diagnostics["estimated_srt_d"])
+            if diagnostics["estimated_srt_d"] is not None
+            else None
+        ),
+        clarifier_surface_overflow_m_d=float(
+            diagnostics["clarifier_surface_overflow_m_d"]
+        ),
         assumptions=[
-            "反应池总体积由实测流量和水力停留时间计算。",
-            "排泥流量由目标污泥龄估算，最终应以现场排泥量替换。",
-            "曝气能耗采用录入功率乘以每日运行时间。",
+            (
+                "反应池采用录入的现场有效容积和分区容积。"
+                if payload.parameters.reactor_volume_m3 is not None
+                else "反应池总体积由流量和水力停留时间计算，分区采用工艺默认比例。"
+            ),
+            (
+                "排泥流量采用同期现场实测值。"
+                if payload.parameters.waste_sludge_flow_m3_d is not None
+                else "排泥流量由目标污泥龄估算，最终应以现场排泥量替换。"
+            ),
+            (
+                "二沉池采用录入的现场总表面积。"
+                if payload.parameters.clarifier_surface_area_m2 is not None
+                else "二沉池表面积按基准表面水力负荷估算。"
+            ),
+            "运行能耗由曝气、搅拌和泵送设备实测功率及运行时长核算。",
+            (
+                f"动态积分从{payload.parameters.simulation_days:.0f}天开始，"
+                f"经{int(diagnostics['convergence_attempts'])}轮自动检查后"
+                f"结束于{float(diagnostics['actual_simulation_days']):.0f}天。"
+            ),
         ] + advanced_assumptions,
         warnings=warnings,
     )

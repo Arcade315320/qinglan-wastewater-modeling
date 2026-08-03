@@ -23,7 +23,7 @@ app = modal.App(APP_NAME)
     image=image,
     memory=4096,
     cpu=2.0,
-    timeout=300,
+    timeout=900,
     scaledown_window=300,
 )
 def run_simulation_task(payload: dict) -> dict:
@@ -33,12 +33,12 @@ def run_simulation_task(payload: dict) -> dict:
             input=json.dumps(payload, ensure_ascii=False),
             text=True,
             capture_output=True,
-            timeout=285,
+            timeout=870,
             check=False,
         )
     except subprocess.TimeoutExpired as error:
         raise RuntimeError(
-            "动态模型计算超过285秒，请缩短积分时长。"
+            "动态模型计算超过870秒，请检查组分、初始状态或改用分段续算。"
         ) from error
     if completed.returncode != 0:
         detail = completed.stderr.strip().splitlines()[-1] if completed.stderr else ""

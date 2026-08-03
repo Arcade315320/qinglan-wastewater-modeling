@@ -15,12 +15,19 @@ from app.services.model_catalog import list_models
 from app.services.qsdsan_adapter import (
     _apply_advanced_treatment,
     _bulk_components,
+    _configure_reactor,
     _ph_activity,
+    _oxygen_transfer_diagnostics,
     _require_dynamic_memory,
+    _simulation_horizons,
     get_engine_status,
 )
 from app.services.simulation_service import run_simulation
-from app.services.simulation_service import _resolve_limits, _validate_model
+from app.services.simulation_service import (
+    _resolve_limits,
+    _run_activated_sludge_screening,
+    _validate_model,
+)
 
 
 def bsm1_payload() -> SimulationRequest:
@@ -31,7 +38,7 @@ def bsm1_payload() -> SimulationRequest:
                 "flow_m3_d": 18446,
                 "cod_mg_l": 381.19,
                 "nh4_n_mg_l": 31.56,
-                "tn_mg_l": 49.1,
+                "tn_mg_l": 54.4744,
                 "tp_mg_l": 0,
                 "tss_mg_l": 211.2675,
                 "ph": 7,
@@ -45,6 +52,8 @@ def bsm1_payload() -> SimulationRequest:
                 "internal_recycle_ratio": 3,
                 "sludge_recycle_ratio": 1,
                 "simulation_days": 100,
+                "aeration_power_kw": 250,
+                "aerobic_kla_d": 240,
             },
             "component_concentrations": {
                 "S_S": 69.5,
@@ -89,6 +98,12 @@ class QSDsanRegressionTests(unittest.TestCase):
         self.assertLess(self.result.mass_balance.hydraulic_relative_error, 1e-6)
         self.assertTrue(self.result.convergence_reached)
         self.assertIn("QSDsan/EXPOsan", self.result.engine)
+
+    def test_asm1_excludes_phosphorus_from_results(self) -> None:
+        self.assertFalse(self.result.applicable_indicators["tp"])
+        self.assertFalse(self.result.compliance["tp"])
+        self.assertNotIn("tp_mg_l", self.result.component_mapping.reconstructed)
+        self.assertIsNone(self.result.mass_balance.phosphorus_recovery)
 
     def test_ph_activity_has_neutral_optimum(self) -> None:
         self.assertEqual(_ph_activity(7.2, 5.5, 7, 8, 9.5), 1)
@@ -156,6 +171,7 @@ class QSDsanRegressionTests(unittest.TestCase):
             + components["X_I"] * 0.02
             + components["X_S"] * 0.04
             + components["X_H"] * 0.07
+            + components["S_NO3"]
         )
         self.assertAlmostEqual(reconstructed_tss, payload.influent.tss_mg_l)
         self.assertLess(
@@ -164,6 +180,35 @@ class QSDsanRegressionTests(unittest.TestCase):
             0.15,
         )
         self.assertIn("约束", method)
+
+    def test_auto_convergence_extends_to_configured_limit(self) -> None:
+        payload = bsm1_payload()
+        payload.parameters.simulation_days = 30
+        payload.parameters.max_simulation_days = 100
+        self.assertEqual(_simulation_horizons(payload), [30, 60, 90, 100])
+
+    def test_aeration_power_limits_unachievable_kla(self) -> None:
+        payload = bsm1_payload()
+        payload.parameters.aeration_power_kw = 15
+        payload.parameters.aerobic_kla_d = 240
+        diagnostics = _oxygen_transfer_diagnostics(
+            payload,
+            {"aerobic_volume": 4000},
+        )
+        self.assertLess(diagnostics["effective_kla_d"], 240)
+        self.assertFalse(diagnostics["oxygen_transfer_sufficient"])
+
+    def test_measured_mode_requires_engineering_evidence(self) -> None:
+        data = bsm1_payload().model_dump()
+        data["parameters"]["operating_data_source"] = "measured"
+        with self.assertRaisesRegex(ValueError, "同期现场实测模式缺少"):
+            SimulationRequest.model_validate(data)
+
+    def test_independent_validation_requires_samples_and_error(self) -> None:
+        data = bsm1_payload().model_dump()
+        data["parameters"]["independent_validation_passed"] = True
+        with self.assertRaisesRegex(ValueError, "至少需要两条"):
+            SimulationRequest.model_validate(data)
 
     def test_suspiciously_low_influent_tss_is_rejected(self) -> None:
         payload = SimulationRequest.model_validate(
@@ -185,6 +230,56 @@ class QSDsanRegressionTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(ValueError, "比值异常低"):
             _bulk_components(payload)
+
+    def test_aao_uses_separate_anaerobic_and_anoxic_zones(self) -> None:
+        payload = SimulationRequest.model_validate(
+            {
+                **bsm1_payload().model_dump(),
+                "parameters": {
+                    **bsm1_payload().parameters.model_dump(),
+                    "process_type": "AAO",
+                    "model_type": "ASM2d",
+                    "anaerobic_volume_m3": 1000,
+                    "anoxic_volume_m3": 1500,
+                    "aerobic_volume_m3": 4500,
+                    "reactor_volume_m3": 7000,
+                    "hrt_h": 9.108,
+                    "aerobic_kla_d": 180,
+                },
+            }
+        )
+        reactor = SimpleNamespace()
+        system = SimpleNamespace(
+            flowsheet=SimpleNamespace(unit=SimpleNamespace(AS=reactor))
+        )
+        _configure_reactor(
+            system,
+            payload,
+            {
+                "anaerobic_volume": 1000,
+                "anoxic_volume": 1500,
+                "aerobic_volume": 4500,
+                "Q_intr": 36000,
+            },
+        )
+        self.assertEqual(list(reactor.V_tanks), [500, 500, 750, 750, 1500, 1500, 1500])
+        self.assertEqual(reactor.internal_recycles, [(6, 2, 36000)])
+        self.assertEqual(list(reactor.kLa), [0, 0, 0, 0, 180, 180, 180])
+
+    def test_partial_zone_volumes_are_rejected(self) -> None:
+        data = bsm1_payload().model_dump()
+        data["parameters"]["anaerobic_volume_m3"] = 1000
+        with self.assertRaisesRegex(ValueError, "必须同时填写"):
+            SimulationRequest.model_validate(data)
+
+    def test_equipment_energy_uses_runtime_and_auxiliary_power(self) -> None:
+        payload = bsm1_payload()
+        payload.parameters.aeration_power_kw = 100
+        payload.parameters.aeration_hours_d = 12
+        payload.parameters.mixing_power_kw = 10
+        payload.parameters.pumping_power_kw = 5
+        result = _run_activated_sludge_screening(payload)
+        self.assertEqual(result.energy_kwh_d, 1560)
 
 class AdvancedTreatmentTests(unittest.TestCase):
     def test_advanced_treatment_meets_target_case_limits(self) -> None:
@@ -251,12 +346,38 @@ class AdvancedTreatmentTests(unittest.TestCase):
                 False,
                 [],
                 [],
+                self._diagnostics(False),
             ),
         ):
             result = run_simulation(payload)
         self.assertTrue(result.advanced_treatment_applied)
+        self.assertFalse(result.compliance_valid)
         self.assertEqual(result.biological_effluent.tn_mg_l, 14)
         self.assertEqual(result.effluent.tn_mg_l, 12)
+
+    def test_conditional_assessment_does_not_authorize_compliance(self) -> None:
+        payload = bsm1_payload()
+        payload.parameters.operating_data_source = "measured"
+        payload.parameters.independent_validation_passed = True
+        payload.component_concentrations = None
+        with patch(
+            "app.services.simulation_service.run_dynamic_system",
+            return_value=(
+                EffluentPrediction(
+                    cod_mg_l=40, nh4_n_mg_l=2, tn_mg_l=12,
+                    tp_mg_l=0.4, tss_mg_l=8,
+                ),
+                EffluentPrediction(
+                    cod_mg_l=40, nh4_n_mg_l=2, tn_mg_l=12,
+                    tp_mg_l=0.4, tss_mg_l=8,
+                ),
+                self._mapping(), self._balance(), 100, 50, True, [], [],
+                self._diagnostics(True),
+            ),
+        ):
+            result = run_simulation(payload)
+        self.assertEqual(result.reliability.level, "筛选计算")
+        self.assertFalse(result.compliance_valid)
 
     @staticmethod
     def _mapping():
@@ -273,6 +394,19 @@ class AdvancedTreatmentTests(unittest.TestCase):
             passed=True, hydraulic_relative_error=0,
             cod_recovery=0.5, nitrogen_recovery=0.5,
         )
+
+    @staticmethod
+    def _diagnostics(converged: bool):
+        return {
+            "actual_simulation_days": 100,
+            "convergence_attempts": 1,
+            "effective_kla_d": 240,
+            "oxygen_transfer_capacity_kg_d": 9000,
+            "oxygen_transfer_sufficient": True,
+            "estimated_srt_d": None,
+            "clarifier_surface_overflow_m_d": 12.3,
+            "return_sludge_relative_error": None,
+        }
 
     def test_unsupported_process_topology_is_rejected(self) -> None:
         payload = bsm1_payload()
@@ -361,6 +495,7 @@ class GroupedCalibrationTests(unittest.TestCase):
         self.assertEqual(result.validation_sample_count, 2)
         self.assertIsNotNone(result.validation_objective)
         self.assertGreater(result.improvement_percent, 50)
+        self.assertTrue(result.validation_passed)
 
     def test_worse_calibration_candidate_is_rejected(self) -> None:
         def worsening_simulation(request):

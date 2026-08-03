@@ -1,0 +1,15 @@
+{
+  "name": "美国中央约翰斯顿污水厂公开边界数据",
+  "source": "https://www.epa.gov/system/files/documents/2022-03/municipal-nutrient-removal-technologies-document-volume-2.pdf",
+  "boundary_note": "最终出水包含生化池和后置反硝化滤池，不能只与生化段直接比较。",
+  "average_flow_m3_d": 15594,
+  "influent_mg_l": {"bod": 320, "tss": 328, "nh4_n": 28, "tn": 31.2, "tp": 5.8},
+  "final_effluent_mg_l": {"bod": 3, "tss": 1.21, "nh4_n": 0.44, "tn": 2.14, "tp": 0.26},
+  "operation_ranges": {
+    "hrt_h": [13.9, 27.9],
+    "srt_d": [7.4, 8.6],
+    "mlss_mg_l": [2300, 2686],
+    "temperature_c": [14, 27],
+    "maximum_internal_recycle_ratio": 4
+  }
+}

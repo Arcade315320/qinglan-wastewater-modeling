@@ -2,6 +2,7 @@ backend/.venv/
 backend/.venv-model/
 .venv/
 backend/generated_reports/
+backend/data/*.sqlite3*
 backend/app/assets/*.ttf
 frontend/node_modules/
 frontend/dist/

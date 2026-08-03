@@ -1,12 +1,14 @@
 import unittest
 import time
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from unittest.mock import Mock, patch
 
 from fastapi.testclient import TestClient
 
 from app.main import app
-from app.models.schemas import SimulationResult
+from app.models.schemas import ProjectCreate, SimulationResult
+from app.services.project_service import SQLiteProjectStore
 
 
 def fake_result(project_id: str) -> SimulationResult:
@@ -51,7 +53,14 @@ def fake_result(project_id: str) -> SimulationResult:
                 "cod": True,
                 "nh4_n": True,
                 "tn": True,
-                "tp": True,
+                "tp": False,
+                "tss": True,
+            },
+            "applicable_indicators": {
+                "cod": True,
+                "nh4_n": True,
+                "tn": True,
+                "tp": False,
                 "tss": True,
             },
             "model_note": "接口测试",
@@ -75,6 +84,33 @@ def fake_result(project_id: str) -> SimulationResult:
 
 
 class ApiWorkflowTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary_directory = TemporaryDirectory()
+        self.store = SQLiteProjectStore(
+            Path(self.temporary_directory.name) / "test.sqlite3"
+        )
+        self.store_patch = patch("app.api.routes.project_store", self.store)
+        self.store_patch.start()
+
+    def tearDown(self) -> None:
+        self.store_patch.stop()
+        self.temporary_directory.cleanup()
+
+    def test_project_and_simulation_survive_store_recreation(self) -> None:
+        project = self.store.create_project(
+            ProjectCreate(
+                name="持久化测试",
+                plant_name="持久化测试污水厂",
+                process_type="AAO",
+            )
+        )
+        result = self.store.add_simulation(fake_result(project.id))
+
+        reopened = SQLiteProjectStore(self.store.database_path)
+
+        self.assertEqual(reopened.get_project(project.id), project)
+        self.assertEqual(reopened.get_simulation(project.id), result)
+
     def test_background_simulation_job(self) -> None:
         client = TestClient(app)
         project = client.post(
@@ -117,6 +153,7 @@ class ApiWorkflowTests(unittest.TestCase):
         self.assertEqual(completed.status_code, 200)
         self.assertEqual(completed.json()["status"], "completed")
         self.assertEqual(completed.json()["result"]["effluent"]["tn_mg_l"], 14)
+        self.assertFalse(completed.json()["result"]["applicable_indicators"]["tp"])
 
     def test_project_simulation_and_report_download(self) -> None:
         client = TestClient(app)

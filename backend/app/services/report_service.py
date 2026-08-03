@@ -31,6 +31,21 @@ def _compliance_label(simulation: SimulationResult, passed: bool) -> str:
     return "达标"
 
 
+def _indicator_rows(simulation: SimulationResult):
+    rows = (
+        ("cod_mg_l", "cod", simulation.limits.cod_mg_l),
+        ("nh4_n_mg_l", "nh4_n", simulation.limits.nh4_n_mg_l),
+        ("tn_mg_l", "tn", simulation.limits.tn_mg_l),
+        ("tp_mg_l", "tp", simulation.limits.tp_mg_l),
+        ("tss_mg_l", "tss", simulation.limits.tss_mg_l),
+    )
+    return [
+        row
+        for row in rows
+        if simulation.applicable_indicators.get(row[1], True)
+    ]
+
+
 def _safe_filename(value: str) -> str:
     allowed = "".join(
         character
@@ -110,6 +125,7 @@ def _create_pdf(
             f"计算引擎：{simulation.engine}<br/>"
             f"结果范围：{'生化段加强化处理最终出水' if simulation.advanced_treatment_applied else '基础生化段与二沉池出水'}<br/>"
             f"排放判定：{simulation.limits.source}，{simulation.limits.basis}<br/>"
+            f"适用指标：{'化学需氧量、氨氮、总氮、悬浮物' if not simulation.applicable_indicators.get('tp', True) else '化学需氧量、氨氮、总氮、总磷、悬浮物'}<br/>"
             f"可信度等级：{simulation.reliability.level}（{simulation.reliability.score}分）<br/>"
             f"计算时间：{simulation.created_at:%Y-%m-%d %H:%M}",
             body_style,
@@ -125,14 +141,7 @@ def _create_pdf(
     )
     removals = simulation.removal_rates.model_dump()
     compliance = simulation.compliance
-    indicator_keys = [
-        ("cod_mg_l", "cod", simulation.limits.cod_mg_l),
-        ("nh4_n_mg_l", "nh4_n", simulation.limits.nh4_n_mg_l),
-        ("tn_mg_l", "tn", simulation.limits.tn_mg_l),
-        ("tp_mg_l", "tp", simulation.limits.tp_mg_l),
-        ("tss_mg_l", "tss", simulation.limits.tss_mg_l),
-    ]
-    for effluent_key, result_key, limit in indicator_keys:
+    for effluent_key, result_key, limit in _indicator_rows(simulation):
         rows.append(
             [
                 INDICATOR_LABELS[effluent_key],
@@ -169,6 +178,9 @@ def _create_pdf(
                 f"水力相对误差：{simulation.mass_balance.hydraulic_relative_error:.3e}<br/>"
                 f"化学需氧量回收比例：{simulation.mass_balance.cod_recovery:.3f}<br/>"
                 f"总氮回收比例：{simulation.mass_balance.nitrogen_recovery:.3f}<br/>"
+                f"实际动态积分时长：{simulation.simulation_days:.0f}天（{simulation.convergence_attempts}轮）<br/>"
+                f"有效传氧系数：{simulation.effective_kla_d or 0:.3f}/天<br/>"
+                f"供氧能力：{simulation.oxygen_transfer_capacity_kg_d or 0:.3f}千克氧/天<br/>"
                 f"质量守恒检查：{'通过' if simulation.mass_balance.passed else '未通过'}<br/>"
                 f"末端准稳态判定：{'达到' if simulation.convergence_reached else '尚未达到'}",
                 body_style,
@@ -209,6 +221,12 @@ def _create_excel(
         ("计算引擎", simulation.engine),
         ("排放判定", f"{simulation.limits.source}，{simulation.limits.basis}"),
         (
+            "适用指标",
+            "化学需氧量、氨氮、总氮、悬浮物"
+            if not simulation.applicable_indicators.get("tp", True)
+            else "化学需氧量、氨氮、总氮、总磷、悬浮物",
+        ),
+        (
             "可信度等级",
             f"{simulation.reliability.level}（{simulation.reliability.score}分）",
         ),
@@ -220,6 +238,12 @@ def _create_excel(
         ),
         ("仿真编号", simulation.simulation_id),
         ("计算时间", simulation.created_at.strftime("%Y-%m-%d %H:%M:%S")),
+        ("实际动态积分时长（天）", simulation.simulation_days),
+        ("自动收敛检查轮数", simulation.convergence_attempts),
+        ("有效传氧系数（每天）", simulation.effective_kla_d),
+        ("供氧能力（千克氧/天）", simulation.oxygen_transfer_capacity_kg_d),
+        ("估算污泥龄（天）", simulation.estimated_srt_d),
+        ("二沉池表面水力负荷（米/天）", simulation.clarifier_surface_overflow_m_d),
         (),
         ("指标", "生化段出水", "最终出水", "限值", "去除率", "达标情况"),
     ]
@@ -230,13 +254,7 @@ def _create_excel(
         else effluent
     )
     removals = simulation.removal_rates.model_dump()
-    for effluent_key, result_key, limit in (
-        ("cod_mg_l", "cod", simulation.limits.cod_mg_l),
-        ("nh4_n_mg_l", "nh4_n", simulation.limits.nh4_n_mg_l),
-        ("tn_mg_l", "tn", simulation.limits.tn_mg_l),
-        ("tp_mg_l", "tp", simulation.limits.tp_mg_l),
-        ("tss_mg_l", "tss", simulation.limits.tss_mg_l),
-    ):
+    for effluent_key, result_key, limit in _indicator_rows(simulation):
         rows.append(
             (
                 INDICATOR_LABELS[effluent_key],
@@ -274,7 +292,8 @@ def _create_excel(
     mapping.append(("水力相对误差", simulation.mass_balance.hydraulic_relative_error))
     mapping.append(("化学需氧量回收比例", simulation.mass_balance.cod_recovery))
     mapping.append(("总氮回收比例", simulation.mass_balance.nitrogen_recovery))
-    mapping.append(("总磷回收比例", simulation.mass_balance.phosphorus_recovery))
+    if simulation.applicable_indicators.get("tp", True):
+        mapping.append(("总磷回收比例", simulation.mass_balance.phosphorus_recovery))
     mapping.append(("质量守恒是否通过", "是" if simulation.mass_balance.passed else "否"))
     mapping.append(("可信度等级", simulation.reliability.level))
     mapping.append(("可信度分数", simulation.reliability.score))

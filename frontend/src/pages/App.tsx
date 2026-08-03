@@ -493,9 +493,35 @@ function InputPage({ navigate }: { navigate: (page: PageId) => void }) {
     internalRecycle: "200",
     sludgeRecycle: "80",
     aerationPower: "15",
+    aerationHours: "24",
+    mixingPower: "0",
+    pumpingPower: "0",
     dissolvedOxygen: "2",
+    aerobicKla: "",
+    oxygenTransferEfficiency: "1.5",
     alkalinity: "250",
-    simulationDays: "10"
+    reactorVolume: "",
+    anaerobicVolume: "",
+    anoxicVolume: "",
+    aerobicVolume: "",
+    clarifierArea: "",
+    clarifierDepth: "",
+    settlerVMax: "",
+    settlerVMaxPractical: "",
+    settlerTssThreshold: "",
+    wasteSludgeFlow: "",
+    mixedLiquorTss: "",
+    returnSludgeTss: "",
+    wasteSludgeTss: "",
+    simulationDays: "30",
+    maxSimulationDays: "100"
+  });
+  const [fractionationValues, setFractionationValues] = useState({
+    solubleCod: "",
+    vfa: "",
+    nitrate: "",
+    nitrite: "",
+    orthophosphate: ""
   });
   const [advancedTreatmentEnabled, setAdvancedTreatmentEnabled] = useState(false);
   const [advancedTreatmentValues, setAdvancedTreatmentValues] = useState({
@@ -508,6 +534,10 @@ function InputPage({ navigate }: { navigate: (page: PageId) => void }) {
   const [operatingDataSource, setOperatingDataSource] = useState<"measured" | "design" | "assumed">("assumed");
   const [advancedTreatmentVerified, setAdvancedTreatmentVerified] = useState(false);
   const [independentValidationPassed, setIndependentValidationPassed] = useState(false);
+  const [validationValues, setValidationValues] = useState({
+    sampleCount: "0",
+    nrmsePercent: ""
+  });
   const [customLimitValues, setCustomLimitValues] = useState({
     cod: "50",
     nh4: "5",
@@ -527,8 +557,17 @@ function InputPage({ navigate }: { navigate: (page: PageId) => void }) {
         `当前尚未建立 ${selectedProcessType} 专用动态拓扑，请先选择 CAS、AO 或 AAO。`
       );
     }
-    if (Number(parameterValues.simulationDays) > 10) {
-      throw new Error("当前线上免费算力最多支持 10 天动态积分。");
+    if (Number(parameterValues.simulationDays) > 100) {
+      throw new Error("单次动态积分最多支持 100 天，更长时段请分段计算。");
+    }
+    const optionalNumber = (value: string) => value.trim() === "" ? null : Number(value);
+    const zoneValues = [
+      parameterValues.anaerobicVolume,
+      parameterValues.anoxicVolume,
+      parameterValues.aerobicVolume
+    ];
+    if (zoneValues.some((value) => value.trim() !== "") && zoneValues.some((value) => value.trim() === "")) {
+      throw new Error("厌氧、缺氧和好氧池有效容积必须同时填写，或全部留空采用工艺默认比例。");
     }
     const waterQuality: WaterQuality = {
       flow_m3_d: numericValue("flow"),
@@ -539,7 +578,12 @@ function InputPage({ navigate }: { navigate: (page: PageId) => void }) {
       tp_mg_l: numericValue("tp"),
       tss_mg_l: numericValue("tss"),
       ph: numericValue("ph"),
-      temperature_c: numericValue("temperature")
+      temperature_c: numericValue("temperature"),
+      soluble_cod_mg_l: optionalNumber(fractionationValues.solubleCod),
+      vfa_as_cod_mg_l: optionalNumber(fractionationValues.vfa),
+      nitrate_n_mg_l: optionalNumber(fractionationValues.nitrate),
+      nitrite_n_mg_l: optionalNumber(fractionationValues.nitrite),
+      orthophosphate_p_mg_l: optionalNumber(fractionationValues.orthophosphate)
     };
     if (waterQuality.nh4_n_mg_l > waterQuality.tn_mg_l) {
       throw new Error("氨氮不能高于总氮，请检查录入值。");
@@ -567,9 +611,30 @@ function InputPage({ navigate }: { navigate: (page: PageId) => void }) {
       internal_recycle_ratio: Number(parameterValues.internalRecycle) / 100,
       sludge_recycle_ratio: Number(parameterValues.sludgeRecycle) / 100,
       aeration_power_kw: Number(parameterValues.aerationPower),
+      aeration_hours_d: Number(parameterValues.aerationHours),
+      mixing_power_kw: Number(parameterValues.mixingPower),
+      pumping_power_kw: Number(parameterValues.pumpingPower),
       aerobic_do_mg_l: Number(parameterValues.dissolvedOxygen),
+      aerobic_kla_d: optionalNumber(parameterValues.aerobicKla),
+      oxygen_transfer_efficiency_kg_o2_kwh: Number(parameterValues.oxygenTransferEfficiency),
       alkalinity_mg_l_caco3: Number(parameterValues.alkalinity),
+      reactor_volume_m3: optionalNumber(parameterValues.reactorVolume),
+      anaerobic_volume_m3: optionalNumber(parameterValues.anaerobicVolume),
+      anoxic_volume_m3: optionalNumber(parameterValues.anoxicVolume),
+      aerobic_volume_m3: optionalNumber(parameterValues.aerobicVolume),
+      clarifier_surface_area_m2: optionalNumber(parameterValues.clarifierArea),
+      clarifier_depth_m: optionalNumber(parameterValues.clarifierDepth),
+      settler_v_max_m_d: optionalNumber(parameterValues.settlerVMax),
+      settler_v_max_practical_m_d: optionalNumber(parameterValues.settlerVMaxPractical),
+      settler_tss_threshold_mg_l: optionalNumber(parameterValues.settlerTssThreshold),
+      waste_sludge_flow_m3_d: optionalNumber(parameterValues.wasteSludgeFlow),
+      mixed_liquor_tss_mg_l: optionalNumber(parameterValues.mixedLiquorTss),
+      return_sludge_tss_mg_l: optionalNumber(parameterValues.returnSludgeTss),
+      waste_sludge_tss_mg_l: optionalNumber(parameterValues.wasteSludgeTss),
       simulation_days: Number(parameterValues.simulationDays),
+      auto_convergence: true,
+      max_simulation_days: Number(parameterValues.maxSimulationDays),
+      convergence_tolerance_per_d: 0.01,
       cod_kinetic_factor: 1,
       nitrification_kinetic_factor: 1,
       denitrification_kinetic_factor: 1,
@@ -588,7 +653,13 @@ function InputPage({ navigate }: { navigate: (page: PageId) => void }) {
       assessment_date: new Date().toISOString().slice(0, 10),
       operating_data_source: operatingDataSource,
       advanced_treatment_verified: advancedTreatmentEnabled && advancedTreatmentVerified,
-      independent_validation_passed: independentValidationPassed
+      independent_validation_passed: independentValidationPassed,
+      independent_validation_sample_count: independentValidationPassed
+        ? Number(validationValues.sampleCount)
+        : 0,
+      independent_validation_nrmse: independentValidationPassed
+        ? Number(validationValues.nrmsePercent) / 100
+        : null
     };
     const customLimits: EffluentLimits | undefined = standard === "custom"
       ? {
@@ -683,6 +754,20 @@ function InputPage({ navigate }: { navigate: (page: PageId) => void }) {
         </div>
       </section>
       <section className="form-section">
+        <div className="section-title"><div><h2>进水实测分项组分</h2><p>用于约束总氮、总磷和可生化碳源分配；留空时仅能进行自动组分化筛选</p></div></div>
+        <div className="indicator-grid">
+          {[
+            ["溶解性化学需氧量", "solubleCod", "mg/L"],
+            ["挥发性脂肪酸（化学需氧量当量）", "vfa", "mg/L"],
+            ["硝态氮", "nitrate", "mg/L"],
+            ["亚硝态氮", "nitrite", "mg/L"],
+            ["正磷酸盐磷", "orthophosphate", "mg/L"]
+          ].map(([name, key, unit]) => (
+            <label className="indicator-field" key={key}><span>{name}</span><div><input value={fractionationValues[key as keyof typeof fractionationValues]} onChange={(event) => setFractionationValues((current) => ({ ...current, [key]: event.target.value }))} /><b>{unit}</b></div></label>
+          ))}
+        </div>
+      </section>
+      <section className="form-section">
         <div className="section-title"><div><h2>判定依据与数据来源</h2><p>排放限值和证据来源直接决定结果能否用于工程复核</p></div></div>
         <div className="form-grid three">
           <label className="field"><span>排放判定口径</span><select value={standard} onChange={(event) => setStandard(event.target.value as typeof standard)}><option value="grade_a">国家标准一级 A（日均）</option><option value="grade_b">国家标准一级 B（日均）</option><option value="custom">项目实际执行限值</option></select><ChevronDown size={16} /></label>
@@ -693,6 +778,12 @@ function InputPage({ navigate }: { navigate: (page: PageId) => void }) {
           <label><input type="checkbox" checked={commissionedBefore2006} onChange={(event) => setCommissionedBefore2006(event.target.checked)} /><span>污水厂在 2006 年前建成，按修改单过渡期处理总磷限值</span></label>
           <label><input type="checkbox" checked={independentValidationPassed} onChange={(event) => setIndependentValidationPassed(event.target.checked)} /><span>已使用独立日期实测数据完成验证并留存记录</span></label>
         </div>
+        {independentValidationPassed && (
+          <div className="indicator-grid custom-limits">
+            <label className="indicator-field"><span>独立验证样本数</span><div><input value={validationValues.sampleCount} onChange={(event) => setValidationValues((current) => ({ ...current, sampleCount: event.target.value }))} /><b>条</b></div></label>
+            <label className="indicator-field"><span>验证归一化均方根误差</span><div><input value={validationValues.nrmsePercent} onChange={(event) => setValidationValues((current) => ({ ...current, nrmsePercent: event.target.value }))} /><b>%</b></div></label>
+          </div>
+        )}
         {standard === "custom" && (
           <div className="indicator-grid custom-limits">
             {[
@@ -755,7 +846,7 @@ function InputPage({ navigate }: { navigate: (page: PageId) => void }) {
         )}
       </section>
       <section className="form-section">
-        <div className="section-title"><div><h2>运行参数</h2><p>用于设定反应器停留时间、污泥龄与回流条件</p></div></div>
+        <div className="section-title"><div><h2>运行与设备参数</h2><p>优先填写同期实测池容、排泥、沉淀和供氧参数；留空项将采用基准估算</p></div></div>
         <div className="indicator-grid parameters">
           {[
             ["水力停留时间", "hrt", "h"],
@@ -763,9 +854,28 @@ function InputPage({ navigate }: { navigate: (page: PageId) => void }) {
             ["内回流比", "internalRecycle", "%"],
             ["污泥回流比", "sludgeRecycle", "%"],
             ["曝气功率", "aerationPower", "kW"],
+            ["每日曝气时长", "aerationHours", "h/d"],
+            ["搅拌总功率", "mixingPower", "kW"],
+            ["泵送总功率", "pumpingPower", "kW"],
             ["好氧池溶解氧", "dissolvedOxygen", "mg/L"],
+            ["现场传氧系数", "aerobicKla", "1/d"],
+            ["氧转移效率", "oxygenTransferEfficiency", "kgO₂/kWh"],
             ["碱度", "alkalinity", "mg/L"],
-            ["动态积分时长", "simulationDays", "d"]
+            ["生化池总有效容积", "reactorVolume", "m³"],
+            ["厌氧池有效容积", "anaerobicVolume", "m³"],
+            ["缺氧池有效容积", "anoxicVolume", "m³"],
+            ["好氧池有效容积", "aerobicVolume", "m³"],
+            ["二沉池总表面积", "clarifierArea", "m²"],
+            ["二沉池有效水深", "clarifierDepth", "m"],
+            ["理论最大沉降速度", "settlerVMax", "m/d"],
+            ["实用最大沉降速度", "settlerVMaxPractical", "m/d"],
+            ["沉降受阻临界污泥浓度", "settlerTssThreshold", "mg/L"],
+            ["实际排泥流量", "wasteSludgeFlow", "m³/d"],
+            ["池内污泥浓度", "mixedLiquorTss", "mg/L"],
+            ["回流污泥浓度", "returnSludgeTss", "mg/L"],
+            ["排泥污泥浓度", "wasteSludgeTss", "mg/L"],
+            ["初始动态积分时长", "simulationDays", "d"],
+            ["自动收敛最大时长", "maxSimulationDays", "d"]
           ].map(([name, key, unit]) => (
             <label className="indicator-field" key={name}><span>{name}</span><div><input value={parameterValues[key as keyof typeof parameterValues]} onChange={(event) => setParameterValues((current) => ({ ...current, [key]: event.target.value }))} /><b>{unit}</b></div></label>
           ))}
@@ -818,9 +928,14 @@ function ResultPage({ navigate }: { navigate: (page: PageId) => void }) {
     { name: "TN", inlet: influent.tn_mg_l, outlet: simulation.effluent.tn_mg_l, limit: simulation.limits.tn_mg_l, key: "tn" },
     { name: "TP", inlet: influent.tp_mg_l, outlet: simulation.effluent.tp_mg_l, limit: simulation.limits.tp_mg_l, key: "tp" },
     { name: "TSS", inlet: influent.tss_mg_l, outlet: simulation.effluent.tss_mg_l, limit: simulation.limits.tss_mg_l, key: "tss" }
-  ].map((row) => ({ ...row, unit: "mg/L", pass: simulation.compliance[row.key] }));
+  ]
+    .filter((row) => simulation.applicable_indicators?.[row.key] !== false)
+    .map((row) => ({ ...row, unit: "mg/L", pass: simulation.compliance[row.key] }));
   const maxValue = Math.max(...resultRows.map((row) => row.inlet));
   const passCount = resultRows.filter((row) => row.pass).length;
+  const indicatorCount = resultRows.length;
+  const phosphorusApplicable = simulation.applicable_indicators?.tp !== false;
+  const complianceReady = simulation.compliance_valid;
   const relevantMappingResiduals = Object.entries(
     simulation.component_mapping.relative_residuals
   ).filter(([key]) => !(simulation.model_id === "ASM1" && key === "tp_mg_l"));
@@ -871,7 +986,7 @@ function ResultPage({ navigate }: { navigate: (page: PageId) => void }) {
     const next = [...calibrationSamples, sample];
     setCalibrationSamples(next);
     setCalibrationState("success");
-    setCalibrationMessage(`已加入第 ${next.length} 条校准样本；至少两条可拟合，五条以上才会保留验证时段。`);
+    setCalibrationMessage(`已加入第 ${next.length} 条校准样本；每组五条以上会保留最新日期，全部分组合计至少两条才可通过独立验证。`);
   };
   const runCalibration = async () => {
     if (!project || calibrationSamples.length < 2) {
@@ -889,7 +1004,10 @@ function ResultPage({ navigate }: { navigate: (page: PageId) => void }) {
         cod_kinetic_factor: result.factors.cod,
         nitrification_kinetic_factor: result.factors.nitrification,
         denitrification_kinetic_factor: result.factors.denitrification,
-        phosphorus_kinetic_factor: result.factors.phosphorus
+        phosphorus_kinetic_factor: result.factors.phosphorus,
+        independent_validation_passed: result.validation_passed,
+        independent_validation_sample_count: result.validation_sample_count,
+        independent_validation_nrmse: result.validation_objective
       };
       const recalculated = await api.simulate(project.id, influent, calibratedParameters);
       setParameters(calibratedParameters);
@@ -910,11 +1028,11 @@ function ResultPage({ navigate }: { navigate: (page: PageId) => void }) {
       <PageHeading eyebrow="03 / 模型计算" title="仿真结果" description="查看动态模型预测、污染物去除效果及出水达标情况。"
         action={<div className="heading-actions"><button className="button secondary" onClick={() => setCalibrationOpen((open) => !open)}><SlidersHorizontal size={17} /> 校准模型</button><button className="button primary" onClick={() => navigate("input")}><Play size={17} fill="currentColor" /> 重新计算</button></div>} />
       <div className="run-summary">
-        <div><span className="success-pulse" /><p><strong>{advancedTreatmentActive && !advancedTreatmentVerified ? "强化处理方案测算完成" : advancedTreatmentActive ? "生化与强化处理计算完成" : "基础生化计算完成"}</strong><small>{new Date(simulation.created_at).toLocaleString("zh-CN")} · 仿真编号 {simulation.simulation_id.slice(0, 8)}</small></p></div>
+        <div><span className="success-pulse" /><p><strong>{!complianceReady ? "计算完成，达标结论待复核" : advancedTreatmentActive && !advancedTreatmentVerified ? "强化处理方案测算完成" : advancedTreatmentActive ? "生化与强化处理计算完成" : "基础生化计算完成"}</strong><small>{new Date(simulation.created_at).toLocaleString("zh-CN")} · 仿真编号 {simulation.simulation_id.slice(0, 8)}</small></p></div>
         <span>计算引擎 <b>{simulation.engine}</b></span>
       </div>
       <div className="result-metrics">
-        <div><Gauge size={20} /><span>综合达标率</span><strong>{passCount * 20}%</strong><small>{passCount} / 5 项达标</small></div>
+        <div><Gauge size={20} /><span>综合达标率</span><strong>{complianceReady ? `${Math.round(passCount / indicatorCount * 100)}%` : "待判定"}</strong><small>{complianceReady ? `${passCount} / ${indicatorCount} 项达标` : "模型尚未满足正式判定条件"}</small></div>
         <div><Droplets size={20} /><span>预测处理水量</span><strong>{influent.flow_m3_d.toLocaleString()}</strong><small>m³/d</small></div>
         <div><Activity size={20} /><span>运行能耗</span><strong>{simulation.energy_kwh_d.toLocaleString()}</strong><small>kWh/d</small></div>
         <div><ClipboardCheck size={20} /><span>干污泥产量</span><strong>{simulation.sludge_kg_d.toLocaleString()}</strong><small>kg/d</small></div>
@@ -927,6 +1045,12 @@ function ResultPage({ navigate }: { navigate: (page: PageId) => void }) {
         <p>{simulation.reliability.decision}</p>
         <small>尚缺：{simulation.reliability.blockers.join("、") || "无"}</small>
       </section>
+      {!phosphorusApplicable && (
+        <div className="info-banner treatment-result-banner">
+          <CircleHelp size={18} />
+          <span>当前采用活性污泥模型一，该模型不包含磷过程；总磷不展示、不参与综合达标率和模型校准。评价总磷请改用活性污泥模型二d或独立除磷模型。</span>
+        </div>
+      )}
       {advancedTreatmentActive && parameters && (
         <div className="info-banner treatment-result-banner">
           <CheckCircle2 size={18} />
@@ -937,12 +1061,12 @@ function ResultPage({ navigate }: { navigate: (page: PageId) => void }) {
           </span>
         </div>
       )}
-      {!advancedTreatmentActive && passCount < 5 && (
+      {!advancedTreatmentActive && passCount < indicatorCount && (
         <div className="info-banner treatment-result-banner untreated-warning">
           <CircleHelp size={18} />
           <span>
             当前为基础生化段与二沉池预测，未启用外加碳源、化学除磷和三级过滤；
-            总氮、总磷或悬浮物超标不代表计算错误，而是当前工艺配置未满足排放限值。
+            {phosphorusApplicable ? "总氮、总磷或悬浮物" : "总氮或悬浮物"}超标不代表计算错误，而是当前工艺配置未满足排放限值。
           </span>
           <button onClick={() => navigate("input")}>配置强化处理</button>
         </div>
@@ -951,11 +1075,11 @@ function ResultPage({ navigate }: { navigate: (page: PageId) => void }) {
         <div className="treatment-stage-summary">
           <strong>处理阶段可追溯</strong>
           <span>
-            生化段出水：总氮 {simulation.biological_effluent.tn_mg_l}、总磷 {simulation.biological_effluent.tp_mg_l}、
+            生化段出水：总氮 {simulation.biological_effluent.tn_mg_l}、{phosphorusApplicable ? `总磷 ${simulation.biological_effluent.tp_mg_l}、` : ""}
             悬浮物 {simulation.biological_effluent.tss_mg_l} 毫克/升
           </span>
           <span>
-            最终出水：总氮 {simulation.effluent.tn_mg_l}、总磷 {simulation.effluent.tp_mg_l}、
+            最终出水：总氮 {simulation.effluent.tn_mg_l}、{phosphorusApplicable ? `总磷 ${simulation.effluent.tp_mg_l}、` : ""}
             悬浮物 {simulation.effluent.tss_mg_l} 毫克/升
           </span>
         </div>
@@ -971,7 +1095,7 @@ function ResultPage({ navigate }: { navigate: (page: PageId) => void }) {
                 <span className="outlet-bar" style={{ width: `${Math.max(3, row.outlet / maxValue * 100)}%` }} />
               </div>
               <span>{row.inlet} → <b>{row.outlet}</b> {row.unit}（限值 {row.limit}）</span>
-              <em className={row.pass ? "pass" : "fail"}>{row.pass ? advancedTreatmentActive && !advancedTreatmentVerified ? "情景达标" : "达标" : "超标"}</em>
+              <em className={!complianceReady ? "pending" : row.pass ? "pass" : "fail"}>{!complianceReady ? "待判定" : row.pass ? advancedTreatmentActive && !advancedTreatmentVerified ? "情景达标" : "达标" : "超标"}</em>
             </div>
           ))}
         </div>
@@ -994,6 +1118,9 @@ function ResultPage({ navigate }: { navigate: (page: PageId) => void }) {
               : apparentRecoveryPassed ? "通过" : "未通过"
           }
           {" · "}{simulation.convergence_reached ? "达到末端准稳态判定" : "尚未达到末端准稳态判定"}
+          {simulation.mass_balance.state_drift_per_d === null
+            ? ""
+            : `（状态漂移 ${(simulation.mass_balance.state_drift_per_d * 100).toFixed(3)}%/天）`}
         </p>
         <p className="recovery-detail">
           化学需氧量 {Math.round(simulation.mass_balance.cod_recovery * 100)}%
@@ -1001,6 +1128,14 @@ function ResultPage({ navigate }: { navigate: (page: PageId) => void }) {
           {simulation.mass_balance.phosphorus_recovery === null
             ? ""
             : ` · 总磷 ${Math.round(simulation.mass_balance.phosphorus_recovery * 100)}%`}
+        </p>
+        <p className="recovery-detail">
+          自动积分 {simulation.requested_simulation_days ?? simulation.simulation_days} → {simulation.simulation_days} 天
+          {" · "}收敛检查 {simulation.convergence_attempts} 轮
+          {simulation.effective_kla_d === null ? "" : ` · 有效传氧系数 ${simulation.effective_kla_d.toFixed(2)}/天`}
+          {simulation.oxygen_transfer_capacity_kg_d === null ? "" : ` · 供氧能力 ${simulation.oxygen_transfer_capacity_kg_d.toFixed(1)}千克氧/天`}
+          {simulation.estimated_srt_d === null ? "" : ` · 估算污泥龄 ${simulation.estimated_srt_d.toFixed(1)}天`}
+          {simulation.clarifier_surface_overflow_m_d === null ? "" : ` · 二沉池表面负荷 ${simulation.clarifier_surface_overflow_m_d.toFixed(1)}米/天`}
         </p>
       </section>
       {calibrationOpen && (
@@ -1014,7 +1149,7 @@ function ResultPage({ navigate }: { navigate: (page: PageId) => void }) {
               ["总氮", "tn_mg_l"],
               ["总磷", "tp_mg_l"],
               ["悬浮物", "tss_mg_l"]
-            ].map(([label, key]) => (
+            ].filter(([, key]) => key !== "tp_mg_l" || phosphorusApplicable).map(([label, key]) => (
               <label className="indicator-field" key={key}><span>实测{label}</span><div><input value={measured[key as keyof typeof measured]} onChange={(event) => setMeasured((current) => ({ ...current, [key]: event.target.value }))} /><b>mg/L</b></div></label>
             ))}
           </div>

@@ -18,6 +18,11 @@ export type WaterQuality = {
   tss_mg_l: number;
   ph: number;
   temperature_c: number;
+  soluble_cod_mg_l?: number | null;
+  vfa_as_cod_mg_l?: number | null;
+  nitrate_n_mg_l?: number | null;
+  nitrite_n_mg_l?: number | null;
+  orthophosphate_p_mg_l?: number | null;
 };
 
 export type ProcessParameters = {
@@ -28,9 +33,30 @@ export type ProcessParameters = {
   internal_recycle_ratio: number;
   sludge_recycle_ratio: number;
   aeration_power_kw: number;
+  aeration_hours_d: number;
+  mixing_power_kw: number;
+  pumping_power_kw: number;
   aerobic_do_mg_l: number;
+  aerobic_kla_d: number | null;
+  oxygen_transfer_efficiency_kg_o2_kwh: number;
   alkalinity_mg_l_caco3: number;
+  reactor_volume_m3: number | null;
+  anaerobic_volume_m3: number | null;
+  anoxic_volume_m3: number | null;
+  aerobic_volume_m3: number | null;
+  clarifier_surface_area_m2: number | null;
+  clarifier_depth_m: number | null;
+  settler_v_max_m_d: number | null;
+  settler_v_max_practical_m_d: number | null;
+  settler_tss_threshold_mg_l: number | null;
+  waste_sludge_flow_m3_d: number | null;
+  mixed_liquor_tss_mg_l: number | null;
+  return_sludge_tss_mg_l: number | null;
+  waste_sludge_tss_mg_l: number | null;
   simulation_days: number;
+  auto_convergence: boolean;
+  max_simulation_days: number;
+  convergence_tolerance_per_d: number;
   cod_kinetic_factor: number;
   nitrification_kinetic_factor: number;
   denitrification_kinetic_factor: number;
@@ -44,6 +70,8 @@ export type ProcessParameters = {
   operating_data_source: "measured" | "design" | "assumed";
   advanced_treatment_verified: boolean;
   independent_validation_passed: boolean;
+  independent_validation_sample_count: number;
+  independent_validation_nrmse: number | null;
 };
 
 export type EffluentLimits = {
@@ -89,6 +117,8 @@ export type SimulationResult = {
   energy_kwh_d: number;
   sludge_kg_d: number;
   compliance: Record<string, boolean>;
+  applicable_indicators: Record<string, boolean>;
+  compliance_valid: boolean;
   model_note: string;
   mass_balance: {
     passed: boolean;
@@ -96,6 +126,7 @@ export type SimulationResult = {
     cod_recovery: number;
     nitrogen_recovery: number;
     phosphorus_recovery: number | null;
+    state_drift_per_d: number | null;
     notes: string[];
   };
   component_mapping: {
@@ -106,6 +137,12 @@ export type SimulationResult = {
   };
   convergence_reached: boolean;
   simulation_days: number;
+  requested_simulation_days: number | null;
+  convergence_attempts: number;
+  effective_kla_d: number | null;
+  oxygen_transfer_capacity_kg_d: number | null;
+  estimated_srt_d: number | null;
+  clarifier_surface_overflow_m_d: number | null;
   assumptions: string[];
   warnings: string[];
 };
@@ -178,7 +215,7 @@ export const api = {
         custom_limits: customLimits
       })
     }).then(async (job) => {
-      for (let attempt = 0; attempt < 180; attempt += 1) {
+      for (let attempt = 0; attempt < 450; attempt += 1) {
         const current = attempt === 0
           ? job
           : await request<SimulationJob>(`/api/simulate/jobs/${job.id}`);
@@ -188,7 +225,7 @@ export const api = {
         }
         await new Promise((resolve) => window.setTimeout(resolve, 2000));
       }
-      throw new Error("动态仿真超过六分钟，请稍后重新运行。");
+      throw new Error("动态仿真超过十五分钟，请检查组分和初始状态后重新运行。");
     });
   },
   calibrate(projectId: string, samples: CalibrationSample[]) {
@@ -197,6 +234,7 @@ export const api = {
       training_sample_count: number;
       validation_sample_count: number;
       validation_objective: number | null;
+      validation_passed: boolean;
       improvement_percent: number;
       warnings: string[];
       method: string;
