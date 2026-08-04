@@ -39,6 +39,7 @@ class EffluentStandard(StrEnum):
 
 class OperatingDataSource(StrEnum):
     measured = "measured"
+    published = "published"
     design = "design"
     assumed = "assumed"
 
@@ -135,7 +136,7 @@ class ProcessParameters(BaseModel):
     tertiary_filter_solids_capture: float = Field(default=0, ge=0, le=0.99)
     simulation_days: float = Field(default=30, ge=5, le=100)
     auto_convergence: bool = True
-    max_simulation_days: float = Field(default=100, ge=5, le=100)
+    max_simulation_days: float = Field(default=100, ge=5, le=365)
     convergence_tolerance_per_d: float = Field(default=0.01, gt=0, le=0.05)
     effluent_standard: EffluentStandard = EffluentStandard.grade_a
     commissioned_before_2006: bool = False

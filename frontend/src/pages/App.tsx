@@ -531,7 +531,7 @@ function InputPage({ navigate }: { navigate: (page: PageId) => void }) {
   });
   const [standard, setStandard] = useState<"grade_a" | "grade_b" | "custom">("grade_a");
   const [commissionedBefore2006, setCommissionedBefore2006] = useState(false);
-  const [operatingDataSource, setOperatingDataSource] = useState<"measured" | "design" | "assumed">("assumed");
+  const [operatingDataSource, setOperatingDataSource] = useState<"measured" | "published" | "design" | "assumed">("assumed");
   const [advancedTreatmentVerified, setAdvancedTreatmentVerified] = useState(false);
   const [independentValidationPassed, setIndependentValidationPassed] = useState(false);
   const [validationValues, setValidationValues] = useState({
@@ -771,7 +771,7 @@ function InputPage({ navigate }: { navigate: (page: PageId) => void }) {
         <div className="section-title"><div><h2>判定依据与数据来源</h2><p>排放限值和证据来源直接决定结果能否用于工程复核</p></div></div>
         <div className="form-grid three">
           <label className="field"><span>排放判定口径</span><select value={standard} onChange={(event) => setStandard(event.target.value as typeof standard)}><option value="grade_a">国家标准一级 A（日均）</option><option value="grade_b">国家标准一级 B（日均）</option><option value="custom">项目实际执行限值</option></select><ChevronDown size={16} /></label>
-          <label className="field"><span>运行参数来源</span><select value={operatingDataSource} onChange={(event) => setOperatingDataSource(event.target.value as typeof operatingDataSource)}><option value="assumed">程序默认假设</option><option value="design">设计或竣工资料</option><option value="measured">同期现场实测</option></select><ChevronDown size={16} /></label>
+          <label className="field"><span>运行参数来源</span><select value={operatingDataSource} onChange={(event) => setOperatingDataSource(event.target.value as typeof operatingDataSource)}><option value="assumed">程序默认假设</option><option value="published">公开文献数据</option><option value="design">设计或竣工资料</option><option value="measured">同期现场实测（参数完整）</option></select><ChevronDown size={16} /></label>
           <label className="field"><span>评估日期</span><input value={new Date().toLocaleDateString("zh-CN")} readOnly /></label>
         </div>
         <div className="evidence-options">

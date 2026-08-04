@@ -67,7 +67,7 @@ export type ProcessParameters = {
   effluent_standard: "grade_a" | "grade_b" | "custom";
   commissioned_before_2006: boolean;
   assessment_date: string;
-  operating_data_source: "measured" | "design" | "assumed";
+  operating_data_source: "measured" | "published" | "design" | "assumed";
   advanced_treatment_verified: boolean;
   independent_validation_passed: boolean;
   independent_validation_sample_count: number;
@@ -171,10 +171,53 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   });
   if (!response.ok) {
     const body = await response.json().catch(() => null);
-    const detail = typeof body?.detail === "string" ? body.detail : `接口返回 ${response.status}`;
+    const detail = formatApiError(body?.detail, response.status);
     throw new Error(detail);
   }
   return response.json() as Promise<T>;
+}
+
+function formatApiError(detail: unknown, status: number): string {
+  if (typeof detail === "string") return detail;
+  if (Array.isArray(detail)) {
+    const messages = detail.flatMap((item) => {
+      if (!item || typeof item !== "object") return [];
+      const error = item as { loc?: unknown; msg?: unknown; type?: unknown; ctx?: Record<string, unknown> };
+      const location = Array.isArray(error.loc)
+        ? error.loc
+          .filter((part) => part !== "body")
+          .map((part) => API_FIELD_NAMES[String(part)] ?? String(part))
+          .join(" → ")
+        : "";
+      const message = translateValidationMessage(error);
+      return [`${location ? `${location}：` : ""}${message}`];
+    });
+    if (messages.length) return messages.join("；");
+  }
+  return `接口返回 ${status}`;
+}
+
+const API_FIELD_NAMES: Record<string, string> = {
+  influent: "进水水质",
+  parameters: "运行参数",
+  max_simulation_days: "自动收敛最大时长",
+  simulation_days: "初始动态积分时长",
+  operating_data_source: "运行参数来源",
+  custom_limits: "自定义排放限值"
+};
+
+function translateValidationMessage(error: {
+  msg?: unknown;
+  type?: unknown;
+  ctx?: Record<string, unknown>;
+}): string {
+  const type = typeof error.type === "string" ? error.type : "";
+  if (type === "missing") return "此项为必填项";
+  if (type === "less_than_equal") return `不能大于${error.ctx?.le ?? "规定上限"}`;
+  if (type === "greater_than_equal") return `不能小于${error.ctx?.ge ?? "规定下限"}`;
+  if (type === "greater_than") return `必须大于${error.ctx?.gt ?? "零"}`;
+  const message = typeof error.msg === "string" ? error.msg : "输入值不符合要求";
+  return message.replace(/^Value error,\s*/i, "");
 }
 
 export const api = {

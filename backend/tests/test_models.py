@@ -184,8 +184,14 @@ class QSDsanRegressionTests(unittest.TestCase):
     def test_auto_convergence_extends_to_configured_limit(self) -> None:
         payload = bsm1_payload()
         payload.parameters.simulation_days = 30
-        payload.parameters.max_simulation_days = 100
-        self.assertEqual(_simulation_horizons(payload), [30, 60, 90, 100])
+        payload.parameters.max_simulation_days = 180
+        self.assertEqual(_simulation_horizons(payload), [30, 60, 90, 120, 150, 180])
+
+    def test_published_data_allows_missing_engineering_evidence(self) -> None:
+        data = bsm1_payload().model_dump()
+        data["parameters"]["operating_data_source"] = "published"
+        payload = SimulationRequest.model_validate(data)
+        self.assertEqual(payload.parameters.operating_data_source, "published")
 
     def test_aeration_power_limits_unachievable_kla(self) -> None:
         payload = bsm1_payload()
