@@ -27,6 +27,10 @@ CHEMICAL_PHOSPHORUS_EFFICIENCY = 0.90
 TERTIARY_FILTER_ENERGY_KWH_M3 = 0.04
 STEADY_STATE_DRIFT_PER_DAY = 0.01
 COMPONENT_MAPPING_TOLERANCE = 0.05
+ASM_REFERENCE_TEMPERATURE_C = {
+    ModelType.asm1: 20.0,
+    ModelType.asm2d: 15.0,
+}
 
 ZONE_FRACTIONS: dict[ProcessType, tuple[float, float, float]] = {
     ProcessType.cas: (0.0, 0.0, 1.0),
@@ -255,23 +259,19 @@ def _bulk_components(payload: SimulationRequest) -> tuple[dict[str, float], str]
             "S_NH": water.nh4_n_mg_l,
             "S_ALK": alkalinity,
             "S_NO": nox_n,
+            "S_ND": organic_n * 0.4,
+            "X_ND": organic_n * 0.6,
         }
         fitted = _fit_bulk_components(
             values,
-            ("S_I", "S_S", "X_I", "X_S", "X_BH"),
+            ("S_I", "S_S", "X_I", "X_S", "X_BH", "S_NO", "S_ND", "X_ND"),
             (
-                (1.0, 1.0, 1.0, 1.0, 1.0),
-                (0.0, 0.0, 0.555555556, 0.555555556, 0.776638708),
+                (1.0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0),
+                (0.0, 0.0, 0.555555556, 0.555555556, 0.776638708, 0.0, 0.0, 0.0),
+                (0.0, 0.0, 0.06, 0.0, 0.086, 1.0, 1.0, 1.0),
             ),
-            (cod, water.tss_mg_l),
+            (cod, water.tss_mg_l, max(0.0, water.tn_mg_l - water.nh4_n_mg_l)),
         )
-        intrinsic_n = (
-            values["X_I"] * 0.06
-            + values["X_BH"] * 0.086
-        )
-        assignable_n = max(0.0, organic_n - intrinsic_n)
-        values["S_ND"] = assignable_n * 0.4
-        values["X_ND"] = assignable_n * 0.6
         mapping_method = (
             "按化学需氧量、总氮和悬浮物约束自动组分化"
             if fitted
@@ -310,44 +310,33 @@ def _bulk_components(payload: SimulationRequest) -> tuple[dict[str, float], str]
             "S_NH4": water.nh4_n_mg_l,
             "S_ALK": alkalinity,
             "S_NO3": nox_n,
+            "S_PO4": (
+                water.orthophosphate_p_mg_l
+                if water.orthophosphate_p_mg_l is not None
+                else water.tp_mg_l * 0.45
+            ),
         }
+        component_ids = (
+            "S_I", "S_F", "S_A", "X_I", "X_S", "X_H", "S_NO3", "S_PO4"
+        )
+        coefficient_rows = [
+            (1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0),
+            (0.0, 0.0, 0.0, 0.75, 0.75, 0.9, 0.0, 0.0),
+            (0.01, 0.03, 0.0, 0.02, 0.04, 0.07, 1.0, 0.0),
+            (0.0, 0.01, 0.0, 0.01, 0.01, 0.02, 0.0, 1.0),
+        ]
+        targets = [cod, water.tss_mg_l, water.tn_mg_l - water.nh4_n_mg_l, water.tp_mg_l]
+        if water.nitrate_n_mg_l is not None or water.nitrite_n_mg_l is not None:
+            coefficient_rows.append((0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0))
+            targets.append(nox_n)
+        if water.orthophosphate_p_mg_l is not None:
+            coefficient_rows.append((0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0))
+            targets.append(water.orthophosphate_p_mg_l)
         fitted = _fit_bulk_components(
             values,
-            ("S_I", "S_F", "S_A", "X_I", "X_S", "X_H"),
-            (
-                (1.0, 1.0, 1.0, 1.0, 1.0, 1.0),
-                (0.0, 0.0, 0.0, 0.75, 0.75, 0.9),
-            ),
-            (cod, water.tss_mg_l),
-            soft_coefficient_rows=(
-                (0.01, 0.03, 0.0, 0.02, 0.04, 0.07),
-            ),
-            soft_targets=(organic_n,),
-            phosphorus_coefficients=(0.0, 0.01, 0.0, 0.01, 0.01, 0.02),
-            phosphorus_target=water.tp_mg_l,
-        )
-        inherent_p = (
-            values["S_F"] * 0.01
-            + values["X_I"] * 0.01
-            + values["X_S"] * 0.01
-            + values["X_H"] * 0.02
-        )
-        inherent_organic_n = (
-            values["S_I"] * 0.01
-            + values["S_F"] * 0.03
-            + values["X_I"] * 0.02
-            + values["X_S"] * 0.04
-            + values["X_H"] * 0.07
-        )
-        inferred_oxidized_n = (
-            water.nitrate_n_mg_l is None and water.nitrite_n_mg_l is None
-        )
-        if inferred_oxidized_n:
-            values["S_NO3"] += max(0.0, organic_n - inherent_organic_n)
-        values["S_PO4"] = (
-            water.orthophosphate_p_mg_l
-            if water.orthophosphate_p_mg_l is not None
-            else max(0.0, water.tp_mg_l - inherent_p)
+            component_ids,
+            tuple(coefficient_rows),
+            tuple(targets),
         )
         mapping_method = (
             "按实测溶解组分及化学需氧量、总氮、总磷和悬浮物约束组分化"
@@ -365,8 +354,8 @@ def _bulk_components(payload: SimulationRequest) -> tuple[dict[str, float], str]
             if fitted
             else "按默认比例自动组分化"
         )
-        if inferred_oxidized_n:
-            mapping_method += "；未测氧化态氮按总氮差额估算"
+        if water.nitrate_n_mg_l is None and water.nitrite_n_mg_l is None:
+            mapping_method += "；未测氧化态氮由总氮守恒约束反演"
     return values, mapping_method
 
 
@@ -379,7 +368,8 @@ def _kinetic_kwargs(payload: SimulationRequest) -> dict[str, float]:
     values = dict(default_asm_kwargs[kind])
     heterotroph_ph = _ph_activity(water.ph, 5.0, 6.5, 8.5, 10.0)
     nitrifier_ph = _ph_activity(water.ph, 5.5, 7.0, 8.0, 9.5)
-    temperature_factor = 1.072 ** (water.temperature_c - 15.0)
+    reference_temperature = ASM_REFERENCE_TEMPERATURE_C[params.model_type]
+    temperature_factor = 1.072 ** (water.temperature_c - reference_temperature)
     if params.model_type == ModelType.asm1:
         values["mu_H"] *= (
             params.cod_kinetic_factor * heterotroph_ph * temperature_factor
@@ -422,6 +412,25 @@ def _temporary_bsm_configuration(payload: SimulationRequest):
         aerobic_volume = total_volume * aerobic_fraction
     unaerated_volume = anaerobic_volume + anoxic_volume
     count_unaerated = 2 if params.model_type == ModelType.asm1 else 4
+    if params.waste_sludge_flow_m3_d is not None:
+        waste_flow = params.waste_sludge_flow_m3_d
+        waste_flow_source = "现场实测排泥流量"
+    elif (
+        params.mixed_liquor_tss_mg_l is not None
+        and params.waste_sludge_tss_mg_l is not None
+    ):
+        waste_flow = (
+            total_volume
+            * params.mixed_liquor_tss_mg_l
+            / params.srt_d
+            / params.waste_sludge_tss_mg_l
+        )
+        waste_flow_source = "由池内固体存量、污泥龄和排泥浓度反算"
+    else:
+        waste_flow = min(flow * 0.08, flow / max(params.srt_d * 5.3, 1.0))
+        waste_flow_source = "缺少固体实测数据，采用基准经验估算"
+    if waste_flow >= flow * 0.25:
+        raise ValueError("排泥流量达到进水流量的25%以上，请核对污泥浓度、池容和单位。")
     values = {
         "Q": flow,
         "Q_ras": flow * params.sludge_recycle_ratio,
@@ -432,9 +441,7 @@ def _temporary_bsm_configuration(payload: SimulationRequest):
             if params.process_type == ProcessType.cas
             else flow * params.internal_recycle_ratio
         ),
-        "Q_was": params.waste_sludge_flow_m3_d or min(
-            flow * 0.08, flow / max(params.srt_d * 5.3, 1.0)
-        ),
+        "Q_was": waste_flow,
         "V_an": max(1.0, unaerated_volume / count_unaerated),
         "V_ae": max(1.0, aerobic_volume / 3),
     }
@@ -448,6 +455,7 @@ def _temporary_bsm_configuration(payload: SimulationRequest):
             "anaerobic_volume": anaerobic_volume,
             "anoxic_volume": anoxic_volume,
             "aerobic_volume": aerobic_volume,
+            "waste_flow_source": waste_flow_source,
         }
     finally:
         for name, value in original.items():
@@ -631,22 +639,39 @@ def _configure_reactor(system, payload: SimulationRequest, config: dict[str, flo
     effective_kla = config.get(
         "effective_kla_d", params.aerobic_kla_d or 0.0
     )
-    if params.model_type == ModelType.asm2d:
+    if params.model_type == ModelType.asm2d or params.step_feed_fractions is not None:
         import numpy as np
 
         reactor = system.flowsheet.unit.AS
         anaerobic = config["anaerobic_volume"]
         anoxic = config["anoxic_volume"]
         aerobic = config["aerobic_volume"]
-        reactor.V_tanks = np.asarray(
-            [max(1.0, anaerobic / 2)] * 2
-            + [max(1.0, anoxic / 2)] * 2
-            + [max(1.0, aerobic / 3)] * 3,
-            dtype=float,
-        )
-        recycle_destination = 2 if params.process_type == ProcessType.aao else 0
-        reactor.internal_recycles = [(6, recycle_destination, config["Q_intr"])]
-        reactor.kLa = np.asarray([0.0] * 4 + [effective_kla] * 3)
+        if params.model_type == ModelType.asm2d:
+            reactor.V_tanks = np.asarray(
+                [max(1.0, anaerobic / 2)] * 2
+                + [max(1.0, anoxic / 2)] * 2
+                + [max(1.0, aerobic / 3)] * 3,
+                dtype=float,
+            )
+            recycle_destination = 2 if params.process_type == ProcessType.aao else 0
+            reactor.internal_recycles = [(6, recycle_destination, config["Q_intr"])]
+            reactor.kLa = np.asarray([0.0] * 4 + [effective_kla] * 3)
+        else:
+            fractions = params.step_feed_fractions or [1.0, 0.0]
+            reactor.V_tanks = np.asarray(
+                [max(1.0, anoxic / 2)] * 2
+                + [max(1.0, aerobic / 3)] * 3,
+                dtype=float,
+            )
+            reactor.influent_fractions = np.asarray(
+                [
+                    [fractions[0], fractions[1], 0.0, 0.0, 0.0],
+                    [1.0, 0.0, 0.0, 0.0, 0.0],
+                ],
+                dtype=float,
+            )
+            reactor.internal_recycles = [(4, 0, config["Q_intr"])]
+            reactor.kLa = np.asarray([0.0] * 2 + [effective_kla] * 3)
         return
 
     for unit_id, fraction in (("O1", 1.0), ("O2", 1.0), ("O3", 0.35)):
@@ -700,7 +725,10 @@ def run_dynamic_system(
         system = bsm.create_system(
             suspended_growth_model=params.model_type.value,
             reactor_model=(
-                "PFR" if params.model_type == ModelType.asm2d else "CSTR"
+                "PFR"
+                if params.model_type == ModelType.asm2d
+                or params.step_feed_fractions is not None
+                else "CSTR"
             ),
             inf_kwargs={
                 "concentrations": components,
@@ -887,10 +915,15 @@ def run_dynamic_system(
             and integration_converged
         )
         warnings = []
-        if "氧化态氮按总氮差额估算" in mapping_method:
+        if "未测氧化态氮由总氮守恒约束反演" in mapping_method:
             warnings.append(
-                "未提供硝态氮和亚硝态氮，模型为闭合总氮采用了差额估算；"
+                "未提供硝态氮和亚硝态氮，模型在非负和总氮守恒约束下进行了反演；"
                 "工程复核必须用实测氧化态氮替换。"
+            )
+        warnings.append(f"排泥流量采用：{config['waste_flow_source']}。")
+        if params.step_feed_fractions is not None:
+            warnings.append(
+                "已启用两点分段进水专用拓扑，进水分别进入两个串联缺氧段。"
             )
         specific_aeration_energy = (
             params.aeration_power_kw * params.aeration_hours_d
@@ -911,7 +944,13 @@ def run_dynamic_system(
                 "录入曝气功率不足以支持现场传氧系数，模型已按可用供氧能力限制传氧。"
             )
         if params.waste_sludge_flow_m3_d is None:
-            warnings.append("未填写现场排泥流量，排泥量仍由目标污泥龄估算。")
+            if (
+                params.mixed_liquor_tss_mg_l is not None
+                and params.waste_sludge_tss_mg_l is not None
+            ):
+                warnings.append("未填写现场排泥流量，已由固体存量、污泥龄和排泥浓度反算。")
+            else:
+                warnings.append("未填写现场排泥流量及完整污泥浓度，排泥量采用基准估算。")
         if params.clarifier_surface_area_m2 is None:
             warnings.append("未填写二沉池总表面积，当前按基准表面水力负荷估算。")
         if any(

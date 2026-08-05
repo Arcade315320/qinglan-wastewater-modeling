@@ -523,6 +523,8 @@ function InputPage({ navigate }: { navigate: (page: PageId) => void }) {
     nitrite: "",
     orthophosphate: ""
   });
+  const [stepFeedEnabled, setStepFeedEnabled] = useState(false);
+  const [firstStepFeedPercent, setFirstStepFeedPercent] = useState("60");
   const [advancedTreatmentEnabled, setAdvancedTreatmentEnabled] = useState(false);
   const [advancedTreatmentValues, setAdvancedTreatmentValues] = useState({
     externalCarbon: "8",
@@ -561,6 +563,13 @@ function InputPage({ navigate }: { navigate: (page: PageId) => void }) {
       throw new Error("单次动态积分最多支持 100 天，更长时段请分段计算。");
     }
     const optionalNumber = (value: string) => value.trim() === "" ? null : Number(value);
+    if (
+      stepFeedEnabled
+      && selectedProcessType === "AO"
+      && (Number(firstStepFeedPercent) <= 0 || Number(firstStepFeedPercent) >= 100)
+    ) {
+      throw new Error("第一缺氧段进水比例必须大于0%且小于100%。");
+    }
     const zoneValues = [
       parameterValues.anaerobicVolume,
       parameterValues.anoxicVolume,
@@ -631,6 +640,9 @@ function InputPage({ navigate }: { navigate: (page: PageId) => void }) {
       mixed_liquor_tss_mg_l: optionalNumber(parameterValues.mixedLiquorTss),
       return_sludge_tss_mg_l: optionalNumber(parameterValues.returnSludgeTss),
       waste_sludge_tss_mg_l: optionalNumber(parameterValues.wasteSludgeTss),
+      step_feed_fractions: stepFeedEnabled && selectedProcessType === "AO"
+        ? [Number(firstStepFeedPercent) / 100, 1 - Number(firstStepFeedPercent) / 100]
+        : null,
       simulation_days: Number(parameterValues.simulationDays),
       auto_convergence: true,
       max_simulation_days: Number(parameterValues.maxSimulationDays),
@@ -880,6 +892,33 @@ function InputPage({ navigate }: { navigate: (page: PageId) => void }) {
             <label className="indicator-field" key={name}><span>{name}</span><div><input value={parameterValues[key as keyof typeof parameterValues]} onChange={(event) => setParameterValues((current) => ({ ...current, [key]: event.target.value }))} /><b>{unit}</b></div></label>
           ))}
         </div>
+        {project?.process_type === "AO" && (
+          <div className="evidence-options treatment-evidence">
+            <label>
+              <input
+                type="checkbox"
+                checked={stepFeedEnabled}
+                onChange={(event) => setStepFeedEnabled(event.target.checked)}
+              />
+              <span>启用两点分段进水专用拓扑</span>
+            </label>
+            {stepFeedEnabled && (
+              <label className="indicator-field">
+                <span>第一缺氧段进水比例</span>
+                <div>
+                  <input
+                    type="number"
+                    min="1"
+                    max="99"
+                    value={firstStepFeedPercent}
+                    onChange={(event) => setFirstStepFeedPercent(event.target.value)}
+                  />
+                  <b>%</b>
+                </div>
+              </label>
+            )}
+          </div>
+        )}
       </section>
       {message && <div className={`save-toast inline ${runState === "error" ? "error" : ""}`} role="status">{runState === "error" ? <span>!</span> : <CheckCircle2 size={17} />}{message}</div>}
       <div className="page-footer-actions">
@@ -1013,9 +1052,24 @@ function ResultPage({ navigate }: { navigate: (page: PageId) => void }) {
       setParameters(calibratedParameters);
       setSimulation(recalculated);
       setCalibrationState("success");
+      const failedIndicators = Object.entries(result.validation_indicator_nrmse)
+        .filter(([, value]) => value > 0.2)
+        .map(([key, value]) => {
+          const labels: Record<string, string> = {
+            cod_mg_l: "化学需氧量",
+            nh4_n_mg_l: "氨氮",
+            tn_mg_l: "总氮",
+            tp_mg_l: "总磷",
+            tss_mg_l: "悬浮物"
+          };
+          return `${labels[key] ?? key} ${(value * 100).toFixed(1)}%`;
+        })
+        .join("、");
       setCalibrationMessage(
-        result.improvement_percent > 0
-          ? `${result.method}完成：训练 ${result.training_sample_count} 条，验证 ${result.validation_sample_count} 条，目标函数改善 ${result.improvement_percent.toFixed(1)}%；候选因子已用完整动态模型复算当前工况。`
+        result.validation_passed
+          ? `${result.method}完成：训练与独立验证的各项误差均不超过20%，验证 ${result.validation_sample_count} 条；候选因子已用完整动态模型复算当前工况。`
+          : result.improvement_percent > 0
+          ? `${result.method}完成，但尚未通过20%逐指标验收。训练 ${result.training_sample_count} 条，验证 ${result.validation_sample_count} 条。${failedIndicators ? `超限：${failedIndicators}。` : "请补充每厂至少两条独立日期数据。"}`
           : `预校准候选参数未降低误差，已保留原参数并完成动态复算。训练 ${result.training_sample_count} 条，验证 ${result.validation_sample_count} 条。`
       );
     } catch (error) {

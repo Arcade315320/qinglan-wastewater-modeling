@@ -7,6 +7,7 @@ from app.models.schemas import (
     EffluentPrediction,
     ModelCalibrationRequest,
     ModelType,
+    ProcessParameters,
     ProcessType,
     SimulationRequest,
 )
@@ -16,6 +17,7 @@ from app.services.qsdsan_adapter import (
     _apply_advanced_treatment,
     _bulk_components,
     _configure_reactor,
+    _kinetic_kwargs,
     _ph_activity,
     _oxygen_transfer_diagnostics,
     _require_dynamic_memory,
@@ -43,7 +45,7 @@ def bsm1_payload() -> SimulationRequest:
                 "tp_mg_l": 0,
                 "tss_mg_l": 211.2675,
                 "ph": 7,
-                "temperature_c": 15,
+                "temperature_c": 20,
             },
             "parameters": {
                 "process_type": "AO",
@@ -109,6 +111,14 @@ class QSDsanRegressionTests(unittest.TestCase):
     def test_ph_activity_has_neutral_optimum(self) -> None:
         self.assertEqual(_ph_activity(7.2, 5.5, 7, 8, 9.5), 1)
         self.assertLess(_ph_activity(3.8, 5.5, 7, 8, 9.5), 0.1)
+
+    def test_asm1_temperature_correction_uses_twenty_degree_reference(self) -> None:
+        payload = bsm1_payload()
+        at_twenty = _kinetic_kwargs(payload)["mu_A"]
+        payload.influent.temperature_c = 10
+        at_ten = _kinetic_kwargs(payload)["mu_A"]
+        self.assertAlmostEqual(at_twenty, 0.5)
+        self.assertAlmostEqual(at_ten / at_twenty, 1.072 ** -10)
 
     def test_asm2d_total_phosphorus_is_not_double_counted(self) -> None:
         payload = SimulationRequest.model_validate(
@@ -281,10 +291,41 @@ class QSDsanRegressionTests(unittest.TestCase):
         self.assertEqual(reactor.internal_recycles, [(6, 2, 36000)])
         self.assertEqual(list(reactor.kLa), [0, 0, 0, 0, 180, 180, 180])
 
+    def test_ao_step_feed_routes_influent_to_two_anoxic_stages(self) -> None:
+        payload = bsm1_payload()
+        payload.parameters.step_feed_fractions = [0.6, 0.4]
+        reactor = SimpleNamespace()
+        system = SimpleNamespace(
+            flowsheet=SimpleNamespace(unit=SimpleNamespace(AS=reactor))
+        )
+        _configure_reactor(
+            system,
+            payload,
+            {
+                "anaerobic_volume": 0,
+                "anoxic_volume": 2000,
+                "aerobic_volume": 3000,
+                "Q_intr": 30000,
+                "effective_kla_d": 120,
+            },
+        )
+        self.assertEqual(
+            reactor.influent_fractions.tolist(),
+            [[0.6, 0.4, 0, 0, 0], [1, 0, 0, 0, 0]],
+        )
+        self.assertEqual(reactor.internal_recycles, [(4, 0, 30000)])
+        self.assertEqual(list(reactor.kLa), [0, 0, 120, 120, 120])
+
+    def test_step_feed_ratios_must_close(self) -> None:
+        data = bsm1_payload().model_dump()
+        data["parameters"]["step_feed_fractions"] = [0.7, 0.4]
+        with self.assertRaisesRegex(ValueError, "比例之和"):
+            SimulationRequest.model_validate(data)
+
     def test_partial_zone_volumes_are_rejected(self) -> None:
         data = bsm1_payload().model_dump()
         data["parameters"]["anaerobic_volume_m3"] = 1000
-        with self.assertRaisesRegex(ValueError, "必须同时填写"):
+        with self.assertRaisesRegex(ValueError, "不应填写厌氧池"):
             SimulationRequest.model_validate(data)
 
     def test_equipment_energy_uses_runtime_and_auxiliary_power(self) -> None:
@@ -535,11 +576,53 @@ class GroupedCalibrationTests(unittest.TestCase):
             side_effect=self._fake_simulation,
         ):
             result = calibrate_model(request)
-        self.assertEqual(result.training_sample_count, 8)
-        self.assertEqual(result.validation_sample_count, 2)
+        self.assertEqual(result.training_sample_count, 6)
+        self.assertEqual(result.validation_sample_count, 4)
         self.assertIsNotNone(result.validation_objective)
         self.assertGreater(result.improvement_percent, 50)
         self.assertTrue(result.validation_passed)
+        self.assertTrue(result.calibration_passed)
+        self.assertTrue(all(value <= 0.2 for value in result.validation_indicator_nrmse.values()))
+
+    def test_validation_rejects_one_indicator_over_twenty_percent(self) -> None:
+        start = datetime(2026, 1, 1)
+        samples = []
+        for index in range(6):
+            samples.append(
+                {
+                    "group_id": "一厂",
+                    "sample_time": start + timedelta(days=index),
+                    "influent": {
+                        "flow_m3_d": 10000,
+                        "cod_mg_l": 300,
+                        "nh4_n_mg_l": 30,
+                        "tn_mg_l": 45,
+                        "tp_mg_l": 5,
+                        "tss_mg_l": 200,
+                        "ph": 7.2,
+                        "temperature_c": 20,
+                    },
+                    "measured": {
+                        "cod_mg_l": 150,
+                        "nh4_n_mg_l": 15,
+                        "tn_mg_l": 22.5,
+                        "tp_mg_l": 2.5,
+                        "tss_mg_l": 5,
+                    },
+                }
+            )
+        request = ModelCalibrationRequest(
+            project_id="indicator-gate",
+            samples=samples,
+            validation_fraction=0.2,
+        )
+        with patch(
+            "app.services.calibration_service._run_activated_sludge_screening",
+            side_effect=self._fake_simulation,
+        ):
+            result = calibrate_model(request)
+        self.assertFalse(result.validation_passed)
+        self.assertGreater(result.validation_indicator_nrmse["tss_mg_l"], 0.2)
 
     def test_worse_calibration_candidate_is_rejected(self) -> None:
         def worsening_simulation(request):
@@ -587,6 +670,76 @@ class GroupedCalibrationTests(unittest.TestCase):
         self.assertEqual(result.factors.cod, 1)
         self.assertEqual(result.improvement_percent, 0)
         self.assertTrue(any("自动拒绝" in item for item in result.warnings))
+
+    def test_mixed_processes_are_rejected(self) -> None:
+        samples = []
+        for index, process in enumerate((ProcessType.cas, ProcessType.ao)):
+            samples.append(
+                {
+                    "group_id": "一厂",
+                    "sample_time": datetime(2026, 1, index + 1),
+                    "influent": {
+                        "flow_m3_d": 10000,
+                        "cod_mg_l": 300,
+                        "nh4_n_mg_l": 30,
+                        "tn_mg_l": 45,
+                        "tp_mg_l": 5,
+                        "tss_mg_l": 200,
+                        "ph": 7.2,
+                        "temperature_c": 20,
+                    },
+                    "measured": {"cod_mg_l": 150},
+                    "parameters": {
+                        "process_type": process,
+                        "model_type": ModelType.asm1,
+                    },
+                }
+            )
+        with self.assertRaisesRegex(ValueError, "同一种工艺"):
+            calibrate_model(
+                ModelCalibrationRequest(project_id="mixed", samples=samples)
+            )
+
+
+class DedicatedTopologyParameterTests(unittest.TestCase):
+    def test_oxidation_ditch_requires_consistent_loop_volume(self) -> None:
+        with self.assertRaisesRegex(ValueError, "氧化沟专用拓扑缺少"):
+            ProcessParameters(process_type=ProcessType.oxidation_ditch)
+        params = ProcessParameters(
+            process_type=ProcessType.oxidation_ditch,
+            oxidation_ditch_channel_count=2,
+            oxidation_ditch_loop_volume_m3=6000,
+            anoxic_volume_m3=1500,
+            aerobic_volume_m3=4500,
+        )
+        self.assertEqual(params.oxidation_ditch_channel_count, 2)
+
+    def test_sbr_cycle_requires_all_phases_to_close(self) -> None:
+        with self.assertRaisesRegex(ValueError, "序批式各阶段时长"):
+            ProcessParameters(
+                process_type=ProcessType.sbr,
+                sbr_reactor_count=4,
+                sbr_cycle_h=6,
+                sbr_fill_h=1,
+                sbr_anoxic_h=1,
+                sbr_aerobic_h=2,
+                sbr_settle_h=1,
+                sbr_decant_h=0.5,
+                sbr_decant_fraction=0.3,
+            )
+
+    def test_mbr_requires_membrane_capacity_inputs(self) -> None:
+        with self.assertRaisesRegex(ValueError, "膜生物反应器专用拓扑缺少"):
+            ProcessParameters(process_type=ProcessType.mbr)
+        params = ProcessParameters(
+            process_type=ProcessType.mbr,
+            reactor_volume_m3=5000,
+            mbr_membrane_area_m2=20000,
+            mbr_design_flux_l_m2_h=15,
+            mbr_recovery=0.95,
+            mbr_air_scour_power_kw=80,
+        )
+        self.assertEqual(params.mbr_recovery, 0.95)
 
 
 if __name__ == "__main__":

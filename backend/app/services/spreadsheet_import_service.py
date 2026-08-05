@@ -69,6 +69,15 @@ def _first_number(*values: object) -> float | None:
     return None
 
 
+def _uncensored_number(
+    row: dict[str, object], value_field: str, symbol_field: str
+) -> float | None:
+    symbol = str(row.get(symbol_field) or "").strip()
+    if symbol in {"<", ">", "≤", "≥"}:
+        return None
+    return _number(row.get(value_field))
+
+
 def _parse_datetime(value: object) -> datetime | None:
     if isinstance(value, datetime):
         return value
@@ -157,9 +166,15 @@ def import_calibration_workbook(
         operation = operation_by_key[key]
         inlet_values = {
             "flow_m3_d": _number(inlet.get("流量（立方米/日）")),
-            "cod_mg_l": _number(inlet.get("化学需氧量（毫克/升）")),
+            "cod_mg_l": _uncensored_number(
+                inlet,
+                "化学需氧量（毫克/升）",
+                "化学需氧量检出限符号",
+            ),
             "bod_mg_l": _number(inlet.get("五日生化需氧量（毫克/升）")),
-            "nh4_n_mg_l": _number(inlet.get("氨氮（毫克/升）")),
+            "nh4_n_mg_l": _uncensored_number(
+                inlet, "氨氮（毫克/升）", "氨氮检出限符号"
+            ),
             "tn_mg_l": _number(inlet.get("总氮（毫克/升）")),
             "tp_mg_l": _number(inlet.get("总磷（毫克/升）")),
             "tss_mg_l": _number(inlet.get("悬浮物（毫克/升）")),
@@ -194,11 +209,23 @@ def import_calibration_workbook(
             ] += 1
             continue
         measured_values = {
-            "cod_mg_l": _number(outlet.get("化学需氧量（毫克/升）")),
-            "nh4_n_mg_l": _number(outlet.get("氨氮（毫克/升）")),
-            "tn_mg_l": _number(outlet.get("总氮（毫克/升）")),
-            "tp_mg_l": _number(outlet.get("总磷（毫克/升）")),
-            "tss_mg_l": _number(outlet.get("悬浮物（毫克/升）")),
+            "cod_mg_l": _uncensored_number(
+                outlet,
+                "化学需氧量（毫克/升）",
+                "化学需氧量检出限符号",
+            ),
+            "nh4_n_mg_l": _uncensored_number(
+                outlet, "氨氮（毫克/升）", "氨氮检出限符号"
+            ),
+            "tn_mg_l": _uncensored_number(
+                outlet, "总氮（毫克/升）", "总氮检出限符号"
+            ),
+            "tp_mg_l": _uncensored_number(
+                outlet, "总磷（毫克/升）", "总磷检出限符号"
+            ),
+            "tss_mg_l": _uncensored_number(
+                outlet, "悬浮物（毫克/升）", "悬浮物检出限符号"
+            ),
         }
         if not any(value is not None for value in measured_values.values()):
             skipped += 1
@@ -216,9 +243,49 @@ def import_calibration_workbook(
                 operation.get("碱度（毫克/升，以碳酸钙计）"),
                 inlet.get("碱度（毫克/升，以碳酸钙计）"),
             ),
+            "reactor_volume_m3": _first_number(
+                operation.get("生化池总有效容积（立方米）"),
+                operation.get("生化池有效容积（立方米）"),
+            ),
+            "clarifier_surface_area_m2": _number(
+                operation.get("二沉池总表面积（平方米）")
+            ),
+            "clarifier_depth_m": _number(operation.get("二沉池有效水深（米）")),
+            "settler_v_max_m_d": _number(
+                operation.get("理论最大沉降速度（米/日）")
+            ),
+            "settler_v_max_practical_m_d": _number(
+                operation.get("实用最大沉降速度（米/日）")
+            ),
+            "settler_tss_threshold_mg_l": _number(
+                operation.get("沉降受阻临界污泥浓度（毫克/升）")
+            ),
+            "waste_sludge_flow_m3_d": _number(
+                operation.get("实际排泥流量（立方米/日）")
+            ),
+            "mixed_liquor_tss_mg_l": _first_number(
+                operation.get("池内污泥浓度（毫克/升）"),
+                operation.get("混合液悬浮固体（毫克/升）"),
+            ),
+            "return_sludge_tss_mg_l": _number(
+                operation.get("回流污泥浓度（毫克/升）")
+            ),
+            "waste_sludge_tss_mg_l": _number(
+                operation.get("排泥污泥浓度（毫克/升）")
+            ),
+        }
+        required_operation_names = {
+            "hrt_h",
+            "srt_d",
+            "internal_recycle_ratio",
+            "sludge_recycle_ratio",
+            "aerobic_do_mg_l",
+            "alkalinity_mg_l_caco3",
         }
         missing_operation = [
-            name for name, value in operation_values.items() if value is None
+            name
+            for name, value in operation_values.items()
+            if name in required_operation_names and value is None
         ]
         if missing_operation:
             skipped += 1
@@ -236,6 +303,11 @@ def import_calibration_workbook(
             ] += 1
             continue
         process_value = project.process_type.value
+        optional_parameters = {
+            name: value
+            for name, value in operation_values.items()
+            if name not in required_operation_names and value is not None
+        }
         parameters = ProcessParameters(
             process_type=project.process_type,
             model_type=(
@@ -257,6 +329,7 @@ def import_calibration_workbook(
                 is not None
                 else 0.98
             ),
+            **optional_parameters,
             operating_data_source=OperatingDataSource.measured,
         )
         samples.append(
@@ -275,6 +348,27 @@ def import_calibration_workbook(
     if not samples:
         warnings.append(
             "没有可用于完整模型校准的记录；不得用零值或模型默认值替代缺失实测数据。"
+        )
+    censored_influent_count = sum(
+        str(row.get(symbol) or "").strip() in {"<", ">", "≤", "≥"}
+        for row in influent_rows
+        for symbol in ("化学需氧量检出限符号", "氨氮检出限符号")
+    )
+    censored_effluent_count = sum(
+        str(row.get(symbol) or "").strip() in {"<", ">", "≤", "≥"}
+        for row in effluent_rows
+        for symbol in (
+            "化学需氧量检出限符号",
+            "氨氮检出限符号",
+            "总氮检出限符号",
+            "总磷检出限符号",
+            "悬浮物检出限符号",
+        )
+    )
+    if censored_influent_count or censored_effluent_count:
+        warnings.append(
+            "检出限符号数据未按精确值参与拟合："
+            f"进水{censored_influent_count}项，出水{censored_effluent_count}项。"
         )
     coverage_fields = {
         "进水流量": (influent_rows, "流量（立方米/日）"),
@@ -295,6 +389,12 @@ def import_calibration_workbook(
         "污泥回流比": (operation_rows, "污泥回流比"),
         "好氧池溶解氧": (operation_rows, "好氧池溶解氧（毫克/升）"),
         "碱度": (operation_rows, "碱度（毫克/升，以碳酸钙计）"),
+        "生化池总有效容积": (operation_rows, "生化池总有效容积（立方米）"),
+        "实际排泥流量": (operation_rows, "实际排泥流量（立方米/日）"),
+        "池内污泥浓度": (operation_rows, "池内污泥浓度（毫克/升）"),
+        "排泥污泥浓度": (operation_rows, "排泥污泥浓度（毫克/升）"),
+        "二沉池总表面积": (operation_rows, "二沉池总表面积（平方米）"),
+        "二沉池有效水深": (operation_rows, "二沉池有效水深（米）"),
     }
     field_coverage = {
         name: round(

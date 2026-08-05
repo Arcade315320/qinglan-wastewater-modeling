@@ -1,5 +1,6 @@
 import json
 import sqlite3
+from datetime import datetime
 from pathlib import Path
 from threading import RLock
 
@@ -9,7 +10,10 @@ from app.models.schemas import (
     ProjectCreate,
     ProjectRecord,
     SimulationResult,
+    SimulationJobRecord,
+    SimulationJobStatus,
 )
+from app.core.config import settings
 
 
 DEFAULT_DATABASE_PATH = (
@@ -18,8 +22,10 @@ DEFAULT_DATABASE_PATH = (
 
 
 class SQLiteProjectStore:
-    def __init__(self, database_path: Path | str = DEFAULT_DATABASE_PATH) -> None:
-        self.database_path = Path(database_path)
+    def __init__(self, database_path: Path | str | None = None) -> None:
+        self.database_path = Path(
+            database_path or settings.database_path or DEFAULT_DATABASE_PATH
+        )
         self.database_path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = RLock()
         self._initialize()
@@ -58,11 +64,23 @@ class SQLiteProjectStore:
                 );
                 CREATE INDEX IF NOT EXISTS simulations_project_time
                     ON simulations(project_id, created_at);
+                CREATE TABLE IF NOT EXISTS simulation_jobs (
+                    id TEXT PRIMARY KEY,
+                    project_id TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    completed_at TEXT,
+                    data TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS simulation_jobs_project_time
+                    ON simulation_jobs(project_id, created_at);
                 """
             )
 
     @staticmethod
-    def _serialize(record: ProjectRecord | MeasurementRecord | SimulationResult) -> str:
+    def _serialize(
+        record: ProjectRecord | MeasurementRecord | SimulationResult | SimulationJobRecord,
+    ) -> str:
         return json.dumps(record.model_dump(mode="json"), ensure_ascii=False)
 
     def save_project(self, project: ProjectRecord) -> ProjectRecord:
@@ -156,5 +174,55 @@ class SQLiteProjectStore:
                 ).fetchone()
         return SimulationResult.model_validate(json.loads(row["data"])) if row else None
 
+    def save_simulation_job(self, job: SimulationJobRecord) -> SimulationJobRecord:
+        with self._lock, self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO simulation_jobs(
+                    id, project_id, status, created_at, completed_at, data
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    status = excluded.status,
+                    completed_at = excluded.completed_at,
+                    data = excluded.data
+                """,
+                (
+                    job.id,
+                    job.project_id,
+                    job.status.value,
+                    job.created_at.isoformat(),
+                    job.completed_at.isoformat() if job.completed_at else None,
+                    self._serialize(job),
+                ),
+            )
+        return job
+
+    def get_simulation_job(self, job_id: str) -> SimulationJobRecord | None:
+        with self._lock, self._connect() as connection:
+            row = connection.execute(
+                "SELECT data FROM simulation_jobs WHERE id = ?", (job_id,)
+            ).fetchone()
+        return SimulationJobRecord.model_validate(json.loads(row["data"])) if row else None
+
+    def fail_interrupted_simulation_jobs(self) -> int:
+        with self._lock, self._connect() as connection:
+            rows = connection.execute(
+                "SELECT data FROM simulation_jobs WHERE status IN (?, ?)",
+                (SimulationJobStatus.queued.value, SimulationJobStatus.running.value),
+            ).fetchall()
+            for row in rows:
+                job = SimulationJobRecord.model_validate(json.loads(row["data"]))
+                self.save_simulation_job(
+                    job.model_copy(
+                        update={
+                            "status": SimulationJobStatus.failed,
+                            "error": "服务重启中断了尚未完成的动态仿真，请重新提交。",
+                            "completed_at": datetime.utcnow(),
+                        }
+                    )
+                )
+        return len(rows)
+
 
 project_store = SQLiteProjectStore()
+project_store.fail_interrupted_simulation_jobs()

@@ -127,6 +127,7 @@ class ProcessParameters(BaseModel):
     mixed_liquor_tss_mg_l: float | None = Field(default=None, gt=0)
     return_sludge_tss_mg_l: float | None = Field(default=None, gt=0)
     waste_sludge_tss_mg_l: float | None = Field(default=None, gt=0)
+    step_feed_fractions: list[float] | None = None
     cod_kinetic_factor: float = Field(default=1.0, ge=0.1, le=5.0)
     nitrification_kinetic_factor: float = Field(default=1.0, ge=0.1, le=5.0)
     denitrification_kinetic_factor: float = Field(default=1.0, ge=0.1, le=5.0)
@@ -146,6 +147,20 @@ class ProcessParameters(BaseModel):
     independent_validation_passed: bool = False
     independent_validation_sample_count: int = Field(default=0, ge=0, le=10000)
     independent_validation_nrmse: float | None = Field(default=None, ge=0)
+    oxidation_ditch_channel_count: int | None = Field(default=None, ge=1, le=20)
+    oxidation_ditch_loop_volume_m3: float | None = Field(default=None, gt=0)
+    sbr_reactor_count: int | None = Field(default=None, ge=1, le=20)
+    sbr_cycle_h: float | None = Field(default=None, gt=0, le=24)
+    sbr_fill_h: float | None = Field(default=None, ge=0, le=24)
+    sbr_anoxic_h: float | None = Field(default=None, ge=0, le=24)
+    sbr_aerobic_h: float | None = Field(default=None, ge=0, le=24)
+    sbr_settle_h: float | None = Field(default=None, ge=0, le=24)
+    sbr_decant_h: float | None = Field(default=None, ge=0, le=24)
+    sbr_decant_fraction: float | None = Field(default=None, gt=0, lt=1)
+    mbr_membrane_area_m2: float | None = Field(default=None, gt=0)
+    mbr_design_flux_l_m2_h: float | None = Field(default=None, gt=0, le=100)
+    mbr_recovery: float | None = Field(default=None, gt=0, le=1)
+    mbr_air_scour_power_kw: float | None = Field(default=None, ge=0)
 
     @model_validator(mode="after")
     def validate_physical_configuration(self):
@@ -157,13 +172,32 @@ class ProcessParameters(BaseModel):
             and self.settler_v_max_practical_m_d > self.settler_v_max_m_d
         ):
             raise ValueError("二沉池实用最大沉降速度不能高于理论最大沉降速度。")
+        if self.step_feed_fractions is not None:
+            if self.process_type != ProcessType.ao:
+                raise ValueError("分段进水专用拓扑目前仅适用于缺氧-好氧工艺。")
+            if self.model_type != ModelType.asm1:
+                raise ValueError("分段进水专用拓扑目前采用活性污泥模型一。")
+            if len(self.step_feed_fractions) != 2:
+                raise ValueError("分段进水必须填写两个缺氧段的进水比例。")
+            if any(value <= 0 or value >= 1 for value in self.step_feed_fractions):
+                raise ValueError("每个分段进水比例必须大于零且小于一。")
+            if abs(sum(self.step_feed_fractions) - 1.0) > 1e-6:
+                raise ValueError("分段进水比例之和必须等于一。")
         zone_volumes = (
             self.anaerobic_volume_m3,
             self.anoxic_volume_m3,
             self.aerobic_volume_m3,
         )
         supplied = [value is not None for value in zone_volumes]
-        if any(supplied) and not all(supplied):
+        if self.process_type == ProcessType.cas:
+            if self.anaerobic_volume_m3 or self.anoxic_volume_m3:
+                raise ValueError("普通活性污泥工艺只能填写好氧池有效容积。")
+        elif self.process_type == ProcessType.ao:
+            if self.anaerobic_volume_m3:
+                raise ValueError("缺氧-好氧工艺不应填写厌氧池有效容积。")
+            if (self.anoxic_volume_m3 is None) != (self.aerobic_volume_m3 is None):
+                raise ValueError("缺氧池和好氧池有效容积必须同时填写。")
+        elif self.process_type != ProcessType.oxidation_ditch and any(supplied) and not all(supplied):
             raise ValueError("厌氧、缺氧和好氧池容必须同时填写。")
         if all(supplied):
             zone_total = sum(float(value) for value in zone_volumes if value is not None)
@@ -182,6 +216,59 @@ class ProcessParameters(BaseModel):
                 raise ValueError("勾选独立验证通过时必须填写验证归一化均方根误差。")
             if self.independent_validation_nrmse > 0.2:
                 raise ValueError("独立验证归一化均方根误差高于20%，不能标记为验证通过。")
+        if self.process_type == ProcessType.oxidation_ditch:
+            required = {
+                "氧化沟沟道数量": self.oxidation_ditch_channel_count,
+                "氧化沟循环有效容积": self.oxidation_ditch_loop_volume_m3,
+                "缺氧区有效容积": self.anoxic_volume_m3,
+                "好氧区有效容积": self.aerobic_volume_m3,
+            }
+            missing = [name for name, value in required.items() if value is None]
+            if missing:
+                raise ValueError("氧化沟专用拓扑缺少：" + "、".join(missing) + "。")
+            zone_volume = float(self.anoxic_volume_m3 or 0) + float(
+                self.aerobic_volume_m3 or 0
+            )
+            loop_volume = float(self.oxidation_ditch_loop_volume_m3)
+            if abs(zone_volume - loop_volume) / loop_volume > 0.01:
+                raise ValueError("氧化沟缺氧区与好氧区容积之和必须等于循环有效容积。")
+        if self.process_type in (ProcessType.sbr, ProcessType.cass):
+            required = {
+                "反应器数量": self.sbr_reactor_count,
+                "运行周期": self.sbr_cycle_h,
+                "进水时长": self.sbr_fill_h,
+                "缺氧反应时长": self.sbr_anoxic_h,
+                "好氧反应时长": self.sbr_aerobic_h,
+                "沉淀时长": self.sbr_settle_h,
+                "滗水时长": self.sbr_decant_h,
+                "滗水比": self.sbr_decant_fraction,
+            }
+            missing = [name for name, value in required.items() if value is None]
+            if missing:
+                raise ValueError("序批式专用拓扑缺少：" + "、".join(missing) + "。")
+            phase_total = sum(
+                float(value or 0)
+                for value in (
+                    self.sbr_fill_h,
+                    self.sbr_anoxic_h,
+                    self.sbr_aerobic_h,
+                    self.sbr_settle_h,
+                    self.sbr_decant_h,
+                )
+            )
+            if abs(phase_total - float(self.sbr_cycle_h)) > 0.01:
+                raise ValueError("序批式各阶段时长之和必须等于运行周期。")
+        if self.process_type == ProcessType.mbr:
+            required = {
+                "膜面积": self.mbr_membrane_area_m2,
+                "设计膜通量": self.mbr_design_flux_l_m2_h,
+                "产水回收率": self.mbr_recovery,
+                "膜擦洗曝气功率": self.mbr_air_scour_power_kw,
+                "生化池总有效容积": self.reactor_volume_m3,
+            }
+            missing = [name for name, value in required.items() if value is None]
+            if missing:
+                raise ValueError("膜生物反应器专用拓扑缺少：" + "、".join(missing) + "。")
         return self
 
 
@@ -237,14 +324,15 @@ class SimulationRequest(BaseModel):
             params.mixed_liquor_tss_mg_l,
             params.waste_sludge_tss_mg_l,
         )
-        sludge_balance_requested = (
-            params.waste_sludge_flow_m3_d is not None
-            or params.waste_sludge_tss_mg_l is not None
-        )
-        if sludge_balance_requested and not all(
+        if params.waste_sludge_flow_m3_d is not None and not all(
             value is not None for value in sludge_balance_fields
         ):
-            raise ValueError("排泥流量、池内污泥浓度和排泥污泥浓度必须同时填写。")
+            raise ValueError("填写实测排泥流量时，必须同时填写池内和排泥污泥浓度。")
+        if (
+            params.waste_sludge_tss_mg_l is not None
+            and params.mixed_liquor_tss_mg_l is None
+        ):
+            raise ValueError("填写排泥污泥浓度时，必须同时填写池内污泥浓度。")
         if all(value is not None for value in sludge_balance_fields):
             volume = params.reactor_volume_m3 or water.flow_m3_d * params.hrt_h / 24
             estimated_srt = (
@@ -467,6 +555,8 @@ class IndicatorCalibrationMetrics(BaseModel):
     initial_rmse: float
     calibrated_rmse: float
     mean_bias: float
+    initial_nrmse: float
+    calibrated_nrmse: float
 
 
 class ModelCalibrationRequest(BaseModel):
@@ -489,6 +579,8 @@ class ModelCalibrationResult(BaseModel):
     validation_sample_count: int
     validation_objective: float | None = None
     validation_passed: bool = False
+    calibration_passed: bool = False
+    validation_indicator_nrmse: dict[str, float] = Field(default_factory=dict)
     method: str = "降阶模型预校准"
     recommendation: str
     warnings: list[str] = Field(default_factory=list)

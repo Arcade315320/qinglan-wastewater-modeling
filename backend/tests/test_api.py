@@ -1,5 +1,6 @@
 import unittest
 import time
+from threading import Lock
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import Mock, patch
@@ -7,7 +8,7 @@ from unittest.mock import Mock, patch
 from fastapi.testclient import TestClient
 
 from app.main import app
-from app.models.schemas import ProjectCreate, SimulationResult
+from app.models.schemas import ProjectCreate, SimulationJobRecord, SimulationResult
 from app.services.project_service import SQLiteProjectStore
 
 
@@ -90,9 +91,14 @@ class ApiWorkflowTests(unittest.TestCase):
             Path(self.temporary_directory.name) / "test.sqlite3"
         )
         self.store_patch = patch("app.api.routes.project_store", self.store)
+        self.job_store_patch = patch(
+            "app.services.simulation_job_service.project_store", self.store
+        )
         self.store_patch.start()
+        self.job_store_patch.start()
 
     def tearDown(self) -> None:
+        self.job_store_patch.stop()
         self.store_patch.stop()
         self.temporary_directory.cleanup()
 
@@ -110,6 +116,14 @@ class ApiWorkflowTests(unittest.TestCase):
 
         self.assertEqual(reopened.get_project(project.id), project)
         self.assertEqual(reopened.get_simulation(project.id), result)
+
+    def test_simulation_job_survives_store_recreation(self) -> None:
+        job = SimulationJobRecord(project_id="persistent-job")
+        self.store.save_simulation_job(job)
+
+        reopened = SQLiteProjectStore(self.store.database_path)
+
+        self.assertEqual(reopened.get_simulation_job(job.id), job)
 
     def test_background_simulation_job(self) -> None:
         client = TestClient(app)
@@ -154,6 +168,59 @@ class ApiWorkflowTests(unittest.TestCase):
         self.assertEqual(completed.json()["status"], "completed")
         self.assertEqual(completed.json()["result"]["effluent"]["tn_mg_l"], 14)
         self.assertFalse(completed.json()["result"]["applicable_indicators"]["tp"])
+
+    def test_remote_simulation_jobs_run_in_parallel(self) -> None:
+        client = TestClient(app)
+        project = client.post(
+            "/api/projects",
+            json={
+                "name": "并行任务测试",
+                "plant_name": "并行任务污水厂",
+                "process_type": "AO",
+            },
+        ).json()
+        state = {"active": 0, "maximum": 0}
+        state_lock = Lock()
+
+        def slow_result(payload):
+            with state_lock:
+                state["active"] += 1
+                state["maximum"] = max(state["maximum"], state["active"])
+            time.sleep(0.08)
+            with state_lock:
+                state["active"] -= 1
+            return fake_result(payload.project_id)
+
+        request = {
+            "project_id": project["id"],
+            "influent": {
+                "flow_m3_d": 5000,
+                "cod_mg_l": 300,
+                "nh4_n_mg_l": 35,
+                "tn_mg_l": 48,
+                "tp_mg_l": 5,
+                "tss_mg_l": 200,
+                "ph": 7.2,
+                "temperature_c": 20,
+            },
+        }
+        with patch(
+            "app.services.simulation_job_service.run_simulation_dispatch",
+            side_effect=slow_result,
+        ):
+            job_ids = [
+                client.post("/api/simulate/jobs", json=request).json()["id"]
+                for _ in range(3)
+            ]
+            for _ in range(100):
+                statuses = [
+                    client.get(f"/api/simulate/jobs/{job_id}").json()["status"]
+                    for job_id in job_ids
+                ]
+                if statuses == ["completed"] * 3:
+                    break
+                time.sleep(0.01)
+        self.assertGreaterEqual(state["maximum"], 2)
 
     def test_project_simulation_and_report_download(self) -> None:
         client = TestClient(app)

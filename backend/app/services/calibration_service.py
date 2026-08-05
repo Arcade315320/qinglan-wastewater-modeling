@@ -1,4 +1,4 @@
-from collections import defaultdict
+from collections import Counter, defaultdict
 from math import sqrt
 from statistics import median
 
@@ -189,11 +189,36 @@ def _indicator_metrics(
                 4,
             ),
             mean_bias=round(sum(calibrated_biases) / len(calibrated_biases), 4),
+            initial_nrmse=_indicator_nrmse(initial_rows)[indicator],
+            calibrated_nrmse=_indicator_nrmse(calibrated_rows)[indicator],
         )
     return result
 
 
+def _indicator_nrmse(
+    rows: list[tuple[dict[str, float], dict[str, float | None]]],
+) -> dict[str, float]:
+    values: dict[str, list[float]] = defaultdict(list)
+    for predicted, measured in rows:
+        for indicator, actual in measured.items():
+            if actual is None:
+                continue
+            scale = max(abs(actual), INDICATOR_SCALES[indicator])
+            values[indicator].append(((predicted[indicator] - actual) / scale) ** 2)
+    return {
+        indicator: round(sqrt(sum(errors) / len(errors)), 6)
+        for indicator, errors in values.items()
+        if errors
+    }
+
+
 def calibrate_model(payload: ModelCalibrationRequest) -> ModelCalibrationResult:
+    configurations = {
+        (sample.parameters.process_type, sample.parameters.model_type)
+        for sample in payload.samples
+    }
+    if len(configurations) != 1:
+        raise ValueError("一次校准只能包含同一种工艺和同一个模型版本。")
     grouped = defaultdict(list)
     for sample in payload.samples:
         grouped[sample.group_id].append(sample)
@@ -202,7 +227,10 @@ def calibrate_model(payload: ModelCalibrationRequest) -> ModelCalibrationResult:
     for samples in grouped.values():
         ordered = sorted(samples, key=lambda item: item.sample_time)
         validation_count = (
-            max(1, round(len(ordered) * payload.validation_fraction))
+            min(
+                len(ordered) - 2,
+                max(2, round(len(ordered) * payload.validation_fraction)),
+            )
             if payload.validation_fraction > 0 and len(ordered) >= 5
             else 0
         )
@@ -268,18 +296,53 @@ def calibrate_model(payload: ModelCalibrationRequest) -> ModelCalibrationResult:
         )
     validation_objective = None
     validation_passed = False
+    training_indicator_nrmse = _indicator_nrmse(calibrated_rows)
+    calibration_passed = bool(training_indicator_nrmse) and all(
+        value <= 0.2 for value in training_indicator_nrmse.values()
+    )
+    validation_indicator_nrmse: dict[str, float] = {}
+    if not calibration_passed:
+        failed = ", ".join(
+            f"{name} {value:.1%}"
+            for name, value in training_indicator_nrmse.items()
+            if value > 0.2
+        )
+        warnings.append(f"训练集存在单指标误差超过20%：{failed}。")
     if validation_samples:
         validation_payload = payload.model_copy(
             update={"samples": validation_samples, "validation_fraction": 0}
         )
-        validation_objective = _objective_from_rows(
-            _predictions(validation_payload, factors)
+        validation_rows = _predictions(validation_payload, factors)
+        validation_objective = _objective_from_rows(validation_rows)
+        validation_indicator_nrmse = _indicator_nrmse(validation_rows)
+        group_validation_counts = Counter(
+            sample.group_id for sample in validation_samples
+        )
+        every_group_has_two = all(
+            count >= 2 for count in group_validation_counts.values()
         )
         validation_passed = (
-            len(validation_samples) >= 2
+            calibration_passed
+            and len(validation_samples) >= 2
+            and every_group_has_two
             and validation_objective <= 0.2
+            and bool(validation_indicator_nrmse)
+            and all(value <= 0.2 for value in validation_indicator_nrmse.values())
             and validation_objective <= best_objective * 1.5
         )
+        failed = {
+            name: value
+            for name, value in validation_indicator_nrmse.items()
+            if value > 0.2
+        }
+        if failed:
+            warnings.append(
+                "独立验证存在单指标误差超过20%："
+                + ", ".join(f"{name} {value:.1%}" for name, value in failed.items())
+                + "。"
+            )
+        if not every_group_has_two:
+            warnings.append("每个污水厂必须至少保留两条未参与拟合的独立日期记录。")
         if validation_objective > best_objective * 1.5:
             warnings.append(
                 "验证误差比训练误差高出50%以上，拟合参数可能不适用于后续日期。"
@@ -306,6 +369,8 @@ def calibrate_model(payload: ModelCalibrationRequest) -> ModelCalibrationResult:
             else None
         ),
         validation_passed=validation_passed,
+        calibration_passed=calibration_passed,
+        validation_indicator_nrmse=validation_indicator_nrmse,
         method="降阶模型预校准",
         recommendation=(
             "将候选因子代入完整QSDsan动态系统，并在未参与拟合的独立日期范围内复核。"

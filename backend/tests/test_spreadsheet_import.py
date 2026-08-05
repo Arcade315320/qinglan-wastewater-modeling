@@ -41,6 +41,13 @@ OPERATION_HEADERS = [
     "曝气功率（千瓦）",
     "碱度（毫克/升，以碳酸钙计）",
     "二沉池固体捕集率",
+    "生化池总有效容积（立方米）",
+    "实际排泥流量（立方米/日）",
+    "池内污泥浓度（毫克/升）",
+    "回流污泥浓度（毫克/升）",
+    "排泥污泥浓度（毫克/升）",
+    "二沉池总表面积（平方米）",
+    "二沉池有效水深（米）",
 ]
 
 
@@ -58,7 +65,8 @@ def workbook_bytes(header_row: int = 1, duplicate_operation: bool = False) -> by
         ),
         "运行参数": (
             OPERATION_HEADERS,
-            ["甲厂", "2026-07-01 08:00:00", 12, 15, 2, 0.8, 2.2, 20, 240, 0.98],
+            ["甲厂", "2026-07-01 08:00:00", 12, 15, 2, 0.8, 2.2, 20, 240, 0.98,
+             4000, 26.67, 3000, 8000, 7500, 650, 4],
         ),
     }
     for name, (headers, values) in rows.items():
@@ -88,6 +96,8 @@ class SpreadsheetImportTests(unittest.TestCase):
         self.assertEqual(result.skipped_count, 0)
         self.assertEqual(result.groups, ["甲厂"])
         self.assertEqual(result.samples[0].parameters.hrt_h, 12)
+        self.assertEqual(result.samples[0].parameters.waste_sludge_flow_m3_d, 26.67)
+        self.assertEqual(result.samples[0].parameters.clarifier_surface_area_m2, 650)
         self.assertEqual(
             result.samples[0].parameters.operating_data_source,
             "measured",
@@ -112,6 +122,20 @@ class SpreadsheetImportTests(unittest.TestCase):
         self.assertEqual(result.duplicate_key_count, 1)
         self.assertTrue(any("多条运行记录" in item for item in result.warnings))
         self.assertTrue(any("重复键" in item for item in result.recommendations))
+
+    def test_censored_effluent_is_not_used_as_exact_measurement(self) -> None:
+        content = workbook_bytes()
+        from openpyxl import load_workbook
+
+        workbook = load_workbook(BytesIO(content))
+        sheet = workbook["出水数据"]
+        sheet.cell(row=1, column=3, value="化学需氧量检出限符号")
+        sheet.cell(row=2, column=3, value="<")
+        target = BytesIO()
+        workbook.save(target)
+        result = import_calibration_workbook(self.project, target.getvalue())
+        self.assertIsNone(result.samples[0].measured.cod_mg_l)
+        self.assertTrue(any("检出限符号" in item for item in result.warnings))
 
 
 if __name__ == "__main__":

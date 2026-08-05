@@ -53,6 +53,7 @@ export type ProcessParameters = {
   mixed_liquor_tss_mg_l: number | null;
   return_sludge_tss_mg_l: number | null;
   waste_sludge_tss_mg_l: number | null;
+  step_feed_fractions?: number[] | null;
   simulation_days: number;
   auto_convergence: boolean;
   max_simulation_days: number;
@@ -72,6 +73,20 @@ export type ProcessParameters = {
   independent_validation_passed: boolean;
   independent_validation_sample_count: number;
   independent_validation_nrmse: number | null;
+  oxidation_ditch_channel_count?: number | null;
+  oxidation_ditch_loop_volume_m3?: number | null;
+  sbr_reactor_count?: number | null;
+  sbr_cycle_h?: number | null;
+  sbr_fill_h?: number | null;
+  sbr_anoxic_h?: number | null;
+  sbr_aerobic_h?: number | null;
+  sbr_settle_h?: number | null;
+  sbr_decant_h?: number | null;
+  sbr_decant_fraction?: number | null;
+  mbr_membrane_area_m2?: number | null;
+  mbr_design_flux_l_m2_h?: number | null;
+  mbr_recovery?: number | null;
+  mbr_air_scour_power_kw?: number | null;
 };
 
 export type EffluentLimits = {
@@ -278,6 +293,8 @@ export const api = {
       validation_sample_count: number;
       validation_objective: number | null;
       validation_passed: boolean;
+      calibration_passed: boolean;
+      validation_indicator_nrmse: Record<string, number>;
       improvement_percent: number;
       warnings: string[];
       method: string;
