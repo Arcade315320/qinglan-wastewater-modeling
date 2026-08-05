@@ -20,6 +20,7 @@ from app.services.qsdsan_adapter import (
     _oxygen_transfer_diagnostics,
     _require_dynamic_memory,
     _simulation_horizons,
+    _temporary_bsm_configuration,
     get_engine_status,
 )
 from app.services.simulation_service import run_simulation
@@ -190,8 +191,16 @@ class QSDsanRegressionTests(unittest.TestCase):
     def test_published_data_allows_missing_engineering_evidence(self) -> None:
         data = bsm1_payload().model_dump()
         data["parameters"]["operating_data_source"] = "published"
+        data["parameters"]["mixed_liquor_tss_mg_l"] = 3300
         payload = SimulationRequest.model_validate(data)
         self.assertEqual(payload.parameters.operating_data_source, "published")
+        self.assertEqual(payload.parameters.mixed_liquor_tss_mg_l, 3300)
+
+    def test_cas_disables_internal_recycle(self) -> None:
+        payload = bsm1_payload()
+        payload.parameters.process_type = ProcessType.cas
+        with _temporary_bsm_configuration(payload) as (_, config):
+            self.assertLess(config["Q_intr"] / config["Q"], 1e-8)
 
     def test_aeration_power_limits_unachievable_kla(self) -> None:
         payload = bsm1_payload()
@@ -419,6 +428,35 @@ class AdvancedTreatmentTests(unittest.TestCase):
         payload.parameters.process_type = ProcessType.mbr
         with self.assertRaisesRegex(ValueError, "尚未建立MBR专用"):
             _validate_model(payload)
+
+    def test_every_process_is_supported_or_explicitly_blocked(self) -> None:
+        supported = {ProcessType.cas, ProcessType.ao, ProcessType.aao}
+        for process in ProcessType:
+            payload = bsm1_payload()
+            payload.parameters.process_type = process
+            payload.parameters.model_type = (
+                ModelType.asm2d if process == ProcessType.aao else ModelType.asm1
+            )
+            with self.subTest(process=process.value):
+                if process in supported:
+                    _validate_model(payload)
+                else:
+                    with self.assertRaisesRegex(ValueError, "专用单元"):
+                        _validate_model(payload)
+
+    def test_supported_process_rejects_wrong_model(self) -> None:
+        cases = (
+            (ProcessType.cas, ModelType.asm2d, ModelType.asm1),
+            (ProcessType.ao, ModelType.asm2d, ModelType.asm1),
+            (ProcessType.aao, ModelType.asm1, ModelType.asm2d),
+        )
+        for process, supplied, expected in cases:
+            payload = bsm1_payload()
+            payload.parameters.process_type = process
+            payload.parameters.model_type = supplied
+            with self.subTest(process=process.value):
+                with self.assertRaisesRegex(ValueError, expected.value):
+                    _validate_model(payload)
 
     def test_standard_limits_follow_temperature_and_transition_date(self) -> None:
         payload = bsm1_payload()

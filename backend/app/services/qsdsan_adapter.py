@@ -425,7 +425,13 @@ def _temporary_bsm_configuration(payload: SimulationRequest):
     values = {
         "Q": flow,
         "Q_ras": flow * params.sludge_recycle_ratio,
-        "Q_intr": flow * params.internal_recycle_ratio,
+        "Q_intr": (
+            # The BSM1 flowsheet requires a non-empty recycle stream. This
+            # numerical trace is hydraulically negligible for CAS operation.
+            flow * 1e-9
+            if params.process_type == ProcessType.cas
+            else flow * params.internal_recycle_ratio
+        ),
         "Q_was": params.waste_sludge_flow_m3_d or min(
             flow * 0.08, flow / max(params.srt_d * 5.3, 1.0)
         ),

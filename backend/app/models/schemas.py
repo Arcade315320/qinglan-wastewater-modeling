@@ -232,16 +232,20 @@ class SimulationRequest(BaseModel):
                 raise ValueError(
                     f"生化池容积与水力停留时间不一致：按流量和池容计算为{calculated_hrt:.2f}小时。"
                 )
-        sludge_fields = (
+        sludge_balance_fields = (
             params.waste_sludge_flow_m3_d,
             params.mixed_liquor_tss_mg_l,
             params.waste_sludge_tss_mg_l,
         )
-        if any(value is not None for value in sludge_fields) and not all(
-            value is not None for value in sludge_fields
+        sludge_balance_requested = (
+            params.waste_sludge_flow_m3_d is not None
+            or params.waste_sludge_tss_mg_l is not None
+        )
+        if sludge_balance_requested and not all(
+            value is not None for value in sludge_balance_fields
         ):
             raise ValueError("排泥流量、池内污泥浓度和排泥污泥浓度必须同时填写。")
-        if all(value is not None for value in sludge_fields):
+        if all(value is not None for value in sludge_balance_fields):
             volume = params.reactor_volume_m3 or water.flow_m3_d * params.hrt_h / 24
             estimated_srt = (
                 volume * float(params.mixed_liquor_tss_mg_l)

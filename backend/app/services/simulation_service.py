@@ -252,8 +252,16 @@ def _validate_model(payload: SimulationRequest) -> None:
             "不能将连续流活性污泥近似结果作为该工艺的准确结果。"
             "目前可运行CAS、AO和AAO；其他工艺需先完成专用QSDsan系统。"
         )
-    if model == ModelType.asm1 and process in P_REMOVAL_PROCESSES:
-        return
+    expected_model = {
+        ProcessType.cas: ModelType.asm1,
+        ProcessType.ao: ModelType.asm1,
+        ProcessType.aao: ModelType.asm2d,
+    }[process]
+    if model != expected_model:
+        raise ValueError(
+            f"{process.value}工艺当前只允许使用{expected_model.value}专用动态模型，"
+            f"不能使用{model.value}近似替代。"
+        )
 
 
 def _run_activated_sludge_screening(payload: SimulationRequest) -> SimulationResult:
