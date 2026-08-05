@@ -49,6 +49,12 @@ const pages: { id: PageId; label: string; icon: typeof Home }[] = [
   { id: "report", label: "报告导出", icon: FileText }
 ];
 
+const entryWallpapers = [
+  { src: "/assets/wastewater-plant-entry.webp", label: "污水处理厂全景" },
+  { src: "/assets/wastewater-plant-blue-hour.webp", label: "蓝调时刻处理厂" },
+  { src: "/assets/wastewater-plant-morning.webp", label: "晨光曝气池" }
+];
+
 const initialIndicators = [
   { name: "流量", key: "flow", value: "5000", unit: "m³/d" },
   { name: "COD", key: "cod", value: "260", unit: "mg/L" },
@@ -280,12 +286,52 @@ function PageHeading({
 }
 
 function HomePage({ navigate }: { navigate: (page: PageId) => void }) {
+  const [activeWallpaper, setActiveWallpaper] = useState(0);
+
+  useEffect(() => {
+    entryWallpapers.forEach(({ src }) => {
+      const image = new Image();
+      image.src = src;
+    });
+  }, []);
+
+  useEffect(() => {
+    const reducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)");
+    if (reducedMotion.matches) return;
+
+    const timer = window.setTimeout(() => {
+      setActiveWallpaper((current) => (current + 1) % entryWallpapers.length);
+    }, 7000);
+
+    return () => window.clearTimeout(timer);
+  }, [activeWallpaper]);
+
   return (
     <section className="entry-page">
+      <div className="entry-wallpapers" aria-hidden="true">
+        {entryWallpapers.map((wallpaper, index) => (
+          <div
+            key={wallpaper.src}
+            className={`entry-wallpaper${index === activeWallpaper ? " active" : ""}`}
+            style={{ backgroundImage: `url(${wallpaper.src})` }}
+          />
+        ))}
+      </div>
       <div className="entry-shade" />
       <div className="entry-content">
         <h1>清澜智评</h1>
         <p>面向污水处理工艺的建模与评估平台。基于 QSDsan 标准工作流，将实测数据、稳态仿真、模型校准与工艺评价连接为清晰可靠的数字化过程。</p>
+      </div>
+      <div className="entry-wallpaper-nav" aria-label="入口背景场景">
+        {entryWallpapers.map((wallpaper, index) => (
+          <button
+            key={wallpaper.src}
+            className={index === activeWallpaper ? "active" : ""}
+            onClick={() => setActiveWallpaper(index)}
+            aria-label={`切换至${wallpaper.label}`}
+            aria-current={index === activeWallpaper ? "true" : undefined}
+          />
+        ))}
       </div>
       <button className="entry-button" onClick={() => navigate("project")} aria-label="进入系统" title="进入系统">
         <ArrowRight size={23} />

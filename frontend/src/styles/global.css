@@ -103,9 +103,19 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
 .entry-page {
   position: relative; min-height: 100vh; min-height: 100svh; overflow: hidden;
   display: flex; align-items: center; padding: 72px 8%;
-  background: #17342e url("/assets/wastewater-plant-entry.png") center / cover no-repeat; color: white;
+  isolation: isolate; background: #17342e; color: white;
 }
-.entry-shade { position: absolute; inset: 0; background: rgba(9, 32, 28, .62); }
+.entry-wallpapers, .entry-wallpaper { position: absolute; inset: 0; }
+.entry-wallpapers { z-index: -3; overflow: hidden; background: #17342e; }
+.entry-wallpaper {
+  opacity: 0; background-position: center; background-size: cover;
+  transform: scale(1.035); transition: opacity 1.4s ease; will-change: opacity, transform;
+}
+.entry-wallpaper.active { opacity: 1; animation: entry-wallpaper-drift 7s ease-out both; }
+.entry-shade {
+  position: absolute; inset: 0; z-index: -2;
+  background: rgba(7, 29, 25, .6);
+}
 .entry-content { position: relative; z-index: 1; width: min(700px, 68%); }
 .entry-content::before { content: ""; display: block; width: 52px; height: 3px; margin-bottom: 25px; background: #75d7b6; }
 .entry-content h1 { margin: 0 0 19px; font-size: 72px; line-height: 1.05; font-weight: 800; text-shadow: 0 3px 18px rgba(0,0,0,.22); }
@@ -116,6 +126,20 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
   background: rgba(15, 61, 52, .7); color: white; transition: transform .18s ease, background .18s ease;
 }
 .entry-button:hover { transform: translateX(4px); background: #1d8069; }
+.entry-wallpaper-nav {
+  position: absolute; left: 8%; bottom: 7%; z-index: 2; display: flex; align-items: center; gap: 8px;
+}
+.entry-wallpaper-nav button {
+  width: 28px; height: 3px; border: 0; border-radius: 2px; padding: 0;
+  background: rgba(255, 255, 255, .38); transition: width .25s ease, background .25s ease;
+}
+.entry-wallpaper-nav button:hover { background: rgba(255, 255, 255, .72); }
+.entry-wallpaper-nav button.active { width: 48px; background: #75d7b6; }
+
+@keyframes entry-wallpaper-drift {
+  from { transform: scale(1.035) translate3d(0, 0, 0); }
+  to { transform: scale(1.095) translate3d(-1.2%, -.7%, 0); }
+}
 
 .content-section, .plain-section, .notice-section, .form-section, .result-section { margin-top: 22px; }
 .section-title { display: flex; align-items: flex-end; justify-content: space-between; gap: 18px; margin-bottom: 18px; }
@@ -374,13 +398,17 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
 }
 
 @media (max-width: 760px) {
-  .entry-page { align-items: flex-end; padding: 36px 22px 105px; background-position: 61% center; }
+  .entry-page { align-items: flex-end; padding: 36px 22px 105px; }
+  .entry-wallpaper { background-position: 61% center; }
   .entry-shade { background: rgba(7, 29, 25, .68); }
   .entry-content { width: 100%; }
   .entry-content::before { width: 42px; margin-bottom: 18px; }
   .entry-content h1 { margin-bottom: 14px; font-size: 46px; }
   .entry-content p { font-size: 13px; line-height: 1.8; }
   .entry-button { right: 22px; bottom: 26px; width: 50px; height: 50px; }
+  .entry-wallpaper-nav { left: 22px; bottom: 43px; gap: 6px; }
+  .entry-wallpaper-nav button { width: 20px; }
+  .entry-wallpaper-nav button.active { width: 34px; }
 
   .app-shell { grid-template-columns: 78px minmax(0, 1fr); }
   .sidebar { width: 78px; padding: 16px 8px 12px; }
@@ -440,4 +468,9 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
   .page-footer-actions .button { width: 100%; }
   .calibration-actions { align-items: stretch; flex-direction: column; }
   .paper { width: 88%; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .entry-wallpaper { transition-duration: .01ms; }
+  .entry-wallpaper.active { animation: none; transform: scale(1.035); }
 }
