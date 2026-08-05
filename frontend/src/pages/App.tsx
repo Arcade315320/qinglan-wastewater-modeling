@@ -50,9 +50,9 @@ const pages: { id: PageId; label: string; icon: typeof Home }[] = [
 ];
 
 const entryWallpapers = [
-  { src: "/assets/wastewater-plant-entry.webp", label: "污水处理厂全景" },
-  { src: "/assets/wastewater-plant-blue-hour.webp", label: "蓝调时刻处理厂" },
-  { src: "/assets/wastewater-plant-morning.webp", label: "晨光曝气池" }
+  { src: `${import.meta.env.BASE_URL}assets/wastewater-plant-entry.webp`, label: "污水处理厂全景" },
+  { src: `${import.meta.env.BASE_URL}assets/wastewater-plant-blue-hour.webp`, label: "蓝调时刻处理厂" },
+  { src: `${import.meta.env.BASE_URL}assets/wastewater-plant-morning.webp`, label: "晨光曝气池" }
 ];
 
 const initialIndicators = [
