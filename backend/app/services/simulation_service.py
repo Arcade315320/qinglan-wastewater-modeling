@@ -1,13 +1,16 @@
 from math import exp
+from datetime import date
 
 from app.models.schemas import (
     ComponentMappingResult,
     EffluentPrediction,
     EffluentLimits,
     EffluentStandard,
+    EffluentAssessmentBasis,
     MassBalanceResult,
     ModelType,
     OperatingDataSource,
+    OperationalEstimateEvidence,
     ProcessType,
     ReliabilityAssessment,
     RemovalRates,
@@ -15,6 +18,13 @@ from app.models.schemas import (
     SimulationResult,
 )
 from app.services.qsdsan_adapter import run_dynamic_system
+from app.services.quality_policy import (
+    COMPONENT_MAPPING_RELATIVE_ERROR,
+    HYDRAULIC_RELATIVE_ERROR,
+    quality_thresholds,
+)
+from app.services.traceability_service import build_simulation_manifest
+from app.services.process_capability_service import RUNNABLE_PROCESS_MODELS
 
 
 PROCESS_ZONE_FRACTIONS: dict[ProcessType, tuple[float, float, float]] = {
@@ -47,20 +57,19 @@ P_REMOVAL_PROCESSES = {
     ProcessType.ifas,
 }
 
-DYNAMIC_SUPPORTED_PROCESSES = {
-    ProcessType.cas,
-    ProcessType.ao,
-    ProcessType.aao,
-}
+DYNAMIC_SUPPORTED_PROCESSES = set(RUNNABLE_PROCESS_MODELS)
 
 
-def _applicable_indicators(model: ModelType) -> dict[str, bool]:
+def _applicable_indicators(
+    model: ModelType,
+    basis: EffluentAssessmentBasis = EffluentAssessmentBasis.daily_average,
+) -> dict[str, bool]:
     return {
         "cod": True,
         "nh4_n": True,
         "tn": True,
         "tp": model != ModelType.asm1,
-        "tss": True,
+        "tss": basis != EffluentAssessmentBasis.instantaneous,
     }
 
 
@@ -86,12 +95,36 @@ def _resolve_limits(payload: SimulationRequest) -> EffluentLimits:
         params.commissioned_before_2006
         and params.assessment_date.year < 2028
     )
-    if params.effluent_standard == EffluentStandard.grade_b:
+    if params.assessment_basis == EffluentAssessmentBasis.instantaneous:
+        if params.assessment_date < date(2026, 3, 1):
+            raise ValueError("瞬时值判定仅适用于2025年修改单生效后的评估日期。")
+        if params.effluent_standard == EffluentStandard.grade_b:
+            values = (
+                90,
+                20 if cold_water else 15,
+                25,
+                2.5 if old_phosphorus_limit else 1.5,
+                20,
+            )
+            level = "一级B"
+        else:
+            values = (
+                75,
+                15 if cold_water else 10,
+                20,
+                1.5 if old_phosphorus_limit else 1,
+                10,
+            )
+            level = "一级A"
+        basis = "瞬时值；悬浮物不属于本表瞬时判定项目"
+    elif params.effluent_standard == EffluentStandard.grade_b:
         values = (60, 15 if cold_water else 8, 20, 1.5 if old_phosphorus_limit else 1, 20)
         level = "一级B"
+        basis = "日均值"
     else:
         values = (50, 8 if cold_water else 5, 15, 1 if old_phosphorus_limit else 0.5, 10)
         level = "一级A"
+        basis = "日均值"
     temperature_note = "水温不高于12摄氏度" if cold_water else "水温高于12摄氏度"
     return EffluentLimits(
         cod_mg_l=values[0],
@@ -99,11 +132,88 @@ def _resolve_limits(payload: SimulationRequest) -> EffluentLimits:
         tn_mg_l=values[2],
         tp_mg_l=values[3],
         tss_mg_l=values[4],
+        basis=basis,
         source=(
             f"GB 18918-2002（含2025年修改单）{level}，{temperature_note}，"
             f"评估日期{params.assessment_date.isoformat()}"
         ),
     )
+
+
+OPERATIONAL_ESTIMATE_CALIBRATION_TOLERANCE = 0.20
+
+
+def _operational_estimate_evidence(
+    payload: SimulationRequest,
+    energy_kwh_d: float,
+    sludge_kg_d: float,
+) -> OperationalEstimateEvidence:
+    params = payload.parameters
+    measured_source = params.operating_data_source == OperatingDataSource.measured
+    measured_energy = params.measured_total_energy_kwh_d
+    measured_sludge = params.measured_dry_sludge_kg_d
+    energy_error = (
+        abs(energy_kwh_d - measured_energy) / measured_energy
+        if measured_energy is not None
+        else None
+    )
+    sludge_error = (
+        abs(sludge_kg_d - measured_sludge) / measured_sludge
+        if measured_sludge is not None
+        else None
+    )
+    energy_calibrated = bool(
+        measured_source
+        and energy_error is not None
+        and energy_error <= OPERATIONAL_ESTIMATE_CALIBRATION_TOLERANCE
+    )
+    sludge_calibrated = bool(
+        measured_source
+        and sludge_error is not None
+        and sludge_error <= OPERATIONAL_ESTIMATE_CALIBRATION_TOLERANCE
+    )
+    return OperationalEstimateEvidence(
+        energy_basis=(
+            "设备功率估算与同期总电表实测对照"
+            if measured_energy is not None
+            else "设备额定功率与运行时长估算"
+        ),
+        energy_calibrated=energy_calibrated,
+        measured_energy_kwh_d=measured_energy,
+        energy_relative_error=round(energy_error, 6) if energy_error is not None else None,
+        energy_uncertainty_relative=0.15 if energy_calibrated else 0.35,
+        sludge_basis=(
+            "模型排泥干固体与同期全厂实际干固体对照"
+            if measured_sludge is not None
+            else "模型排泥流干固体估算"
+        ),
+        sludge_calibrated=sludge_calibrated,
+        measured_dry_sludge_kg_d=measured_sludge,
+        sludge_relative_error=round(sludge_error, 6) if sludge_error is not None else None,
+        sludge_uncertainty_relative=0.20 if sludge_calibrated else 0.40,
+        calibration_tolerance_relative=OPERATIONAL_ESTIMATE_CALIBRATION_TOLERANCE,
+    )
+
+
+def _operational_estimate_warnings(
+    evidence: OperationalEstimateEvidence,
+) -> list[str]:
+    warnings = []
+    if not evidence.energy_calibrated:
+        detail = (
+            f"，与实测总能耗偏差{evidence.energy_relative_error * 100:.1f}%"
+            if evidence.energy_relative_error is not None
+            else "，尚无同期总电表数据"
+        )
+        warnings.append(f"运行能耗属于设备功率估算{detail}，不得作为能耗考核实绩。")
+    if not evidence.sludge_calibrated:
+        detail = (
+            f"，与实测干固体偏差{evidence.sludge_relative_error * 100:.1f}%"
+            if evidence.sludge_relative_error is not None
+            else "，尚无同期全厂干固体称量"
+        )
+        warnings.append(f"干污泥产量属于模型排泥估算{detail}，不得作为处置结算依据。")
+    return warnings
 
 
 def _assess_reliability(
@@ -124,18 +234,7 @@ def _assess_reliability(
     ]
     water = payload.influent
     params = payload.parameters
-    fractionation_fields = (
-        water.soluble_cod_mg_l,
-        water.nitrate_n_mg_l,
-        water.nitrite_n_mg_l,
-    ) + (
-        (water.vfa_as_cod_mg_l, water.orthophosphate_p_mg_l)
-        if params.model_type == ModelType.asm2d
-        else ()
-    )
-    measured_fractionation = payload.component_concentrations is not None or all(
-        value is not None for value in fractionation_fields
-    )
+    measured_fractionation = mapping.engineering_complete
     measured_operations = (
         params.operating_data_source == OperatingDataSource.measured
         and params.reactor_volume_m3 is not None
@@ -157,22 +256,27 @@ def _assess_reliability(
         and diagnostics["return_sludge_relative_error"] <= 0.25
     )
     checks = {
-        "组分重构": max(relevant_residuals, default=0) <= 0.05,
-        "水力闭合": mass_balance.hydraulic_relative_error <= 1e-5,
+        "组分重构": max(relevant_residuals, default=0) <= COMPONENT_MAPPING_RELATIVE_ERROR,
+        "水力闭合": mass_balance.hydraulic_relative_error <= HYDRAULIC_RELATIVE_ERROR,
+        "元素与库存闭合": mass_balance.element_balance_passed,
         "动态稳态": convergence_reached,
         "实测模型组分": measured_fractionation,
         "同期实测运行参数": measured_operations,
         "供氧能力一致": bool(diagnostics.get("oxygen_transfer_sufficient")),
         "二沉池实测校准": measured_settler,
-        "独立时段验证": params.independent_validation_passed,
+        "独立时段验证": (
+            params.independent_validation_passed
+            and params.validation_record_id is not None
+        ),
         "强化处理现场核实": (
             not advanced_treatment_applied
             or payload.parameters.advanced_treatment_verified
         ),
     }
     weights = {
-        "组分重构": 10,
-        "水力闭合": 10,
+        "组分重构": 5,
+        "水力闭合": 5,
+        "元素与库存闭合": 10,
         "动态稳态": 15,
         "实测模型组分": 15,
         "同期实测运行参数": 15,
@@ -184,6 +288,7 @@ def _assess_reliability(
     score = sum(weight for name, weight in weights.items() if checks[name])
     critical_evidence = (
         checks["动态稳态"],
+        checks["元素与库存闭合"],
         checks["实测模型组分"],
         checks["同期实测运行参数"],
         checks["独立时段验证"],
@@ -435,6 +540,22 @@ def _run_activated_sludge_screening(payload: SimulationRequest) -> SimulationRes
     engine_name = f"{model.value} reduced-order steady-state screening"
     limits = _resolve_limits(payload)
     advanced_treatment_applied = False
+    energy_kwh_d = round(
+        params.aeration_power_kw * params.aeration_hours_d
+        + params.mixing_power_kw * 24
+        + params.pumping_power_kw * 24,
+        2,
+    )
+    sludge_kg_d = round(
+        influent.flow_m3_d
+        * max(0.0, influent.tss_mg_l - effluent.tss_mg_l)
+        / 1000,
+        2,
+    )
+    operational_evidence = _operational_estimate_evidence(
+        payload, energy_kwh_d, sludge_kg_d
+    )
+    warnings.extend(_operational_estimate_warnings(operational_evidence))
     return SimulationResult(
         project_id=payload.project_id,
         model_id=model,
@@ -451,18 +572,9 @@ def _run_activated_sludge_screening(payload: SimulationRequest) -> SimulationRes
             blockers=["完整动态系统", "实测模型组分", "独立时段验证"],
         ),
         removal_rates=removal,
-        energy_kwh_d=round(
-            params.aeration_power_kw * params.aeration_hours_d
-            + params.mixing_power_kw * 24
-            + params.pumping_power_kw * 24,
-            2,
-        ),
-        sludge_kg_d=round(
-            influent.flow_m3_d
-            * max(0.0, influent.tss_mg_l - effluent.tss_mg_l)
-            / 1000,
-            2,
-        ),
+        energy_kwh_d=energy_kwh_d,
+        sludge_kg_d=sludge_kg_d,
+        operational_estimate_evidence=operational_evidence,
         compliance={
             "cod": effluent.cod_mg_l <= limits.cod_mg_l,
             "nh4_n": effluent.nh4_n_mg_l <= limits.nh4_n_mg_l,
@@ -470,7 +582,9 @@ def _run_activated_sludge_screening(payload: SimulationRequest) -> SimulationRes
             "tp": False if model == ModelType.asm1 else effluent.tp_mg_l <= limits.tp_mg_l,
             "tss": effluent.tss_mg_l <= limits.tss_mg_l,
         },
-        applicable_indicators=_applicable_indicators(model),
+        applicable_indicators=_applicable_indicators(
+            model, payload.parameters.assessment_basis
+        ),
         compliance_valid=False,
         model_note=(
             "降阶筛选采用QSDsan与国际水协活性污泥模型动力学默认值；"
@@ -494,6 +608,8 @@ def _run_activated_sludge_screening(payload: SimulationRequest) -> SimulationRes
             nitrogen_recovery=0,
             notes=["降阶筛选不执行动态质量守恒判定。"],
         ),
+        quality_thresholds=quality_thresholds(params.convergence_tolerance_per_d),
+        manifest=build_simulation_manifest(payload, limits.source),
         convergence_reached=False,
         simulation_days=params.simulation_days,
         assumptions=[
@@ -558,6 +674,10 @@ def run_simulation(payload: SimulationRequest) -> SimulationResult:
         advanced_treatment_applied,
         diagnostics,
     )
+    operational_evidence = _operational_estimate_evidence(
+        payload, energy_kwh_d, sludge_kg_d
+    )
+    warnings.extend(_operational_estimate_warnings(operational_evidence))
     if (
         advanced_treatment_applied
         and not payload.parameters.advanced_treatment_verified
@@ -586,6 +706,7 @@ def run_simulation(payload: SimulationRequest) -> SimulationResult:
         removal_rates=removal,
         energy_kwh_d=energy_kwh_d,
         sludge_kg_d=sludge_kg_d,
+        operational_estimate_evidence=operational_evidence,
         compliance={
             "cod": effluent.cod_mg_l <= limits.cod_mg_l,
             "nh4_n": effluent.nh4_n_mg_l <= limits.nh4_n_mg_l,
@@ -597,7 +718,10 @@ def run_simulation(payload: SimulationRequest) -> SimulationResult:
             ),
             "tss": effluent.tss_mg_l <= limits.tss_mg_l,
         },
-        applicable_indicators=_applicable_indicators(payload.parameters.model_type),
+        applicable_indicators=_applicable_indicators(
+            payload.parameters.model_type,
+            payload.parameters.assessment_basis,
+        ),
         compliance_valid=(
             convergence_reached
             and mass_balance.passed
@@ -615,6 +739,10 @@ def run_simulation(payload: SimulationRequest) -> SimulationResult:
         ),
         component_mapping=mapping,
         mass_balance=mass_balance,
+        quality_thresholds=quality_thresholds(
+            payload.parameters.convergence_tolerance_per_d
+        ),
+        manifest=build_simulation_manifest(payload, limits.source),
         convergence_reached=convergence_reached,
         simulation_days=float(diagnostics["actual_simulation_days"]),
         requested_simulation_days=payload.parameters.simulation_days,
@@ -622,6 +750,21 @@ def run_simulation(payload: SimulationRequest) -> SimulationResult:
         effective_kla_d=float(diagnostics["effective_kla_d"]),
         oxygen_transfer_capacity_kg_d=float(
             diagnostics["oxygen_transfer_capacity_kg_d"]
+        ),
+        corrected_oxygen_saturation_mg_l=(
+            float(diagnostics["corrected_oxygen_saturation_mg_l"])
+            if diagnostics.get("corrected_oxygen_saturation_mg_l") is not None
+            else None
+        ),
+        reactor_ph_used=(
+            float(diagnostics["reactor_ph_used"])
+            if diagnostics.get("reactor_ph_used") is not None
+            else None
+        ),
+        alkalinity_margin_mg_l_caco3=(
+            float(diagnostics["alkalinity_margin_mg_l_caco3"])
+            if diagnostics.get("alkalinity_margin_mg_l_caco3") is not None
+            else None
         ),
         estimated_srt_d=(
             float(diagnostics["estimated_srt_d"])
@@ -631,6 +774,13 @@ def run_simulation(payload: SimulationRequest) -> SimulationResult:
         clarifier_surface_overflow_m_d=float(
             diagnostics["clarifier_surface_overflow_m_d"]
         ),
+        dynamic_influent_applied=bool(diagnostics["dynamic_influent_applied"]),
+        influent_profile_period_days=(
+            float(diagnostics["influent_profile_period_days"])
+            if diagnostics["influent_profile_period_days"] is not None
+            else None
+        ),
+        hot_start_applied=bool(diagnostics["hot_start_applied"]),
         assumptions=[
             (
                 "反应池采用录入的现场有效容积和分区容积。"
@@ -647,11 +797,17 @@ def run_simulation(payload: SimulationRequest) -> SimulationResult:
                 if payload.parameters.clarifier_surface_area_m2 is not None
                 else "二沉池表面积按基准表面水力负荷估算。"
             ),
-            "运行能耗由曝气、搅拌和泵送设备实测功率及运行时长核算。",
+            f"运行能耗口径：{operational_evidence.energy_basis}。",
+            f"干污泥产量口径：{operational_evidence.sludge_basis}。",
             (
                 f"动态积分从{payload.parameters.simulation_days:.0f}天开始，"
                 f"经{int(diagnostics['convergence_attempts'])}轮自动检查后"
                 f"结束于{float(diagnostics['actual_simulation_days']):.0f}天。"
+            ),
+            (
+                "动态进水按完整周期重复，并以同一周期相位比较末端状态。"
+                if diagnostics["dynamic_influent_applied"]
+                else "进水在动态积分期间保持恒定。"
             ),
         ] + advanced_assumptions,
         warnings=warnings,

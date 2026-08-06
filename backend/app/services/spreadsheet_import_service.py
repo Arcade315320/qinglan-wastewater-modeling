@@ -273,6 +273,12 @@ def import_calibration_workbook(
             "waste_sludge_tss_mg_l": _number(
                 operation.get("排泥污泥浓度（毫克/升）")
             ),
+            "measured_total_energy_kwh_d": _number(
+                operation.get("全厂同期实测总能耗（千瓦时/日）")
+            ),
+            "measured_dry_sludge_kg_d": _number(
+                operation.get("全厂同期实测干污泥产量（千克/日）")
+            ),
         }
         required_operation_names = {
             "hrt_h",

@@ -33,6 +33,9 @@ import {
   apiUrl,
   type CalibrationSample,
   type EffluentLimits,
+  type HotStartState,
+  type InfluentTimePoint,
+  type ProcessCapability,
   type ProcessParameters,
   type ProjectRecord,
   type SimulationResult,
@@ -98,7 +101,21 @@ type ProcessDefinition = {
   features: string[];
 };
 
-const dynamicSupportedProcesses = new Set(["CAS", "AO", "AAO"]);
+const fallbackDynamicProcesses = new Set(["CAS", "AO", "AAO"]);
+
+function useProcessCapabilities() {
+  const [capabilities, setCapabilities] = useState<ProcessCapability[]>([]);
+  useEffect(() => {
+    api.listProcessCapabilities().then(setCapabilities).catch(() => undefined);
+  }, []);
+  const runnable = new Set(
+    capabilities.filter((item) => item.runnable).map((item) => item.process_type)
+  );
+  return {
+    capabilities,
+    runnable: capabilities.length ? runnable : fallbackDynamicProcesses
+  };
+}
 
 const processCatalog: ProcessDefinition[] = [
   {
@@ -341,6 +358,7 @@ function HomePage({ navigate }: { navigate: (page: PageId) => void }) {
 }
 
 function ProjectPage() {
+  const { capabilities, runnable } = useProcessCapabilities();
   const {
     project: createdProject,
     setProject,
@@ -362,10 +380,25 @@ function ProjectPage() {
     description: "基于实测进出水数据，对 AAO 工艺进行动态仿真、参数校准与达标评估。",
     designScale: "5000"
   });
+  useEffect(() => {
+    if (!createdProject) return;
+    setProcessType(createdProject.process_type);
+    setProjectForm((current) => ({
+      ...current,
+      name: createdProject.name,
+      code: createdProject.project_code ?? current.code,
+      owner: createdProject.owner ?? "",
+      location: createdProject.location ?? "",
+      period: createdProject.modeling_period ?? "",
+      description: createdProject.description ?? "",
+      designScale: createdProject.design_flow_m3_d?.toString() ?? current.designScale
+    }));
+  }, [createdProject?.id]);
   const selectedProcess = processCatalog.find((item) => item.id === processType) ?? processCatalog[0];
+  const selectedCapability = capabilities.find((item) => item.process_type === processType);
   const readinessItems: [string, string, boolean][] = [
     ["项目及工艺信息", createdProject ? "已保存" : "待保存", Boolean(createdProject)],
-    ["专用动态拓扑", dynamicSupportedProcesses.has(processType) ? "已建立" : "尚未建立", dynamicSupportedProcesses.has(processType)],
+    ["专用动态拓扑", runnable.has(processType) ? "已建立" : "尚未建立", runnable.has(processType)],
     ["进水水质数据", influent ? "已录入" : "待录入", Boolean(influent)],
     ["运行参数", parameters ? "已录入" : "待录入", Boolean(parameters)],
     ["动态计算与守恒", simulation?.mass_balance.passed ? "已通过" : "待通过", Boolean(simulation?.mass_balance.passed)],
@@ -398,15 +431,25 @@ function ProjectPage() {
       plant_name: name,
       process_type: processType,
       owner: projectForm.owner.trim(),
-      description: projectForm.description.trim() || null
+      description: projectForm.description.trim() || null,
+      project_code: projectForm.code.trim() || null,
+      location: projectForm.location.trim() || null,
+      modeling_period: projectForm.period.trim() || null,
+      design_flow_m3_d: Number(projectForm.designScale)
     };
 
     try {
-      const record = await api.createProject(projectPayload);
+      const record = createdProject
+        ? await api.updateProject(createdProject.id, projectPayload)
+        : await api.createProject(projectPayload);
       setProject(record);
       setDirty(false);
       setSaveState("success");
-      setSaveMessage(`项目已创建，ID：${record.id}`);
+      setSaveMessage(
+        createdProject
+          ? `项目已更新至第 ${record.revision} 版。`
+          : `项目已创建，ID：${record.id}`
+      );
       window.setTimeout(() => setSaveState("idle"), 4000);
     } catch (error) {
       setSaveState("error");
@@ -448,14 +491,14 @@ function ProjectPage() {
       </section>
 
       <section className="form-section">
-        <div className="section-title"><div><h2>工艺路线</h2><p>选择主体工艺并确认模型中的处理单元顺序</p></div><span className="process-tag">{dynamicSupportedProcesses.has(processType) ? "可运行动态模型" : "待建专用模型"}</span></div>
+        <div className="section-title"><div><h2>工艺路线</h2><p>选择主体工艺并确认模型中的处理单元顺序</p></div><span className="process-tag">{selectedCapability?.status ?? (runnable.has(processType) ? "专用动态拓扑可运行" : "能力状态加载中")}</span></div>
         <div className="form-grid three">
           <label className="field process-select-field"><span>主体工艺 *</span>
             <select value={processType} onChange={(event) => { setProcessType(event.target.value); markDirty(); }}>
               {processCategories.map((category) => (
                 <optgroup label={category} key={category}>
                   {processCatalog.filter((item) => item.category === category).map((item) => (
-                    <option value={item.id} key={item.id}>{item.label}</option>
+                    <option value={item.id} key={item.id}>{item.label}{runnable.has(item.id) ? " · 可运行" : " · 仅建档"}</option>
                   ))}
                 </optgroup>
               ))}
@@ -478,7 +521,7 @@ function ProjectPage() {
           <span>关键结构</span>
           <div>{selectedProcess.features.map((feature) => <small key={feature}><CheckCircle2 size={14} />{feature}</small>)}</div>
         </div>
-        <div className="process-note"><CircleHelp size={16} /><span>{dynamicSupportedProcesses.has(processType) ? "当前工艺已映射为 QSDsan 动态反应器、回流和二沉池系统。" : "当前仅展示标准工艺流程，尚未建立该工艺专用动态单元和回流拓扑，因此系统会阻止将近似值作为准确结果。"}</span></div>
+        <div className="process-note"><CircleHelp size={16} /><span>{selectedCapability?.limitation ?? selectedCapability?.topology ?? "正在读取后端模型能力。"}</span></div>
         {createdProject && (
           <div className="backend-record">
             <Database size={16} />
@@ -525,6 +568,7 @@ function ProjectPage() {
 }
 
 function InputPage({ navigate }: { navigate: (page: PageId) => void }) {
+  const { runnable } = useProcessCapabilities();
   const {
     project,
     setInfluent,
@@ -545,6 +589,12 @@ function InputPage({ navigate }: { navigate: (page: PageId) => void }) {
     dissolvedOxygen: "2",
     aerobicKla: "",
     oxygenTransferEfficiency: "1.5",
+    oxygenAlphaFactor: "0.80",
+    oxygenBetaFactor: "0.95",
+    diffuserFoulingFactor: "0.90",
+    siteAltitude: "0",
+    diffuserSubmergence: "4",
+    reactorPh: "",
     alkalinity: "250",
     reactorVolume: "",
     anaerobicVolume: "",
@@ -559,6 +609,8 @@ function InputPage({ navigate }: { navigate: (page: PageId) => void }) {
     mixedLiquorTss: "",
     returnSludgeTss: "",
     wasteSludgeTss: "",
+    measuredTotalEnergy: "",
+    measuredDrySludge: "",
     simulationDays: "30",
     maxSimulationDays: "100"
   });
@@ -578,14 +630,10 @@ function InputPage({ navigate }: { navigate: (page: PageId) => void }) {
     filterCapture: "85"
   });
   const [standard, setStandard] = useState<"grade_a" | "grade_b" | "custom">("grade_a");
+  const [assessmentBasis, setAssessmentBasis] = useState<"daily_average" | "instantaneous">("daily_average");
   const [commissionedBefore2006, setCommissionedBefore2006] = useState(false);
   const [operatingDataSource, setOperatingDataSource] = useState<"measured" | "published" | "design" | "assumed">("assumed");
   const [advancedTreatmentVerified, setAdvancedTreatmentVerified] = useState(false);
-  const [independentValidationPassed, setIndependentValidationPassed] = useState(false);
-  const [validationValues, setValidationValues] = useState({
-    sampleCount: "0",
-    nrmsePercent: ""
-  });
   const [customLimitValues, setCustomLimitValues] = useState({
     cod: "50",
     nh4: "5",
@@ -593,6 +641,8 @@ function InputPage({ navigate }: { navigate: (page: PageId) => void }) {
     tp: "0.5",
     tss: "10"
   });
+  const [influentSeries, setInfluentSeries] = useState<InfluentTimePoint[] | undefined>();
+  const [hotStart, setHotStart] = useState<HotStartState | undefined>();
   const [runState, setRunState] = useState<"idle" | "saving" | "running" | "error">("idle");
   const [message, setMessage] = useState("");
   const updateValue = (key: string, value: string) =>
@@ -600,7 +650,7 @@ function InputPage({ navigate }: { navigate: (page: PageId) => void }) {
   const numericValue = (key: string) => Number(indicators.find((item) => item.key === key)?.value ?? 0);
   const buildPayload = () => {
     const selectedProcessType = project?.process_type ?? "AAO";
-    if (!dynamicSupportedProcesses.has(selectedProcessType)) {
+    if (!runnable.has(selectedProcessType)) {
       throw new Error(
         `当前尚未建立 ${selectedProcessType} 专用动态拓扑，请先选择 CAS、AO 或 AAO。`
       );
@@ -672,6 +722,12 @@ function InputPage({ navigate }: { navigate: (page: PageId) => void }) {
       aerobic_do_mg_l: Number(parameterValues.dissolvedOxygen),
       aerobic_kla_d: optionalNumber(parameterValues.aerobicKla),
       oxygen_transfer_efficiency_kg_o2_kwh: Number(parameterValues.oxygenTransferEfficiency),
+      oxygen_alpha_factor: Number(parameterValues.oxygenAlphaFactor),
+      oxygen_beta_factor: Number(parameterValues.oxygenBetaFactor),
+      diffuser_fouling_factor: Number(parameterValues.diffuserFoulingFactor),
+      site_altitude_m: Number(parameterValues.siteAltitude),
+      diffuser_submergence_m: Number(parameterValues.diffuserSubmergence),
+      reactor_ph: optionalNumber(parameterValues.reactorPh),
       alkalinity_mg_l_caco3: Number(parameterValues.alkalinity),
       reactor_volume_m3: optionalNumber(parameterValues.reactorVolume),
       anaerobic_volume_m3: optionalNumber(parameterValues.anaerobicVolume),
@@ -686,6 +742,8 @@ function InputPage({ navigate }: { navigate: (page: PageId) => void }) {
       mixed_liquor_tss_mg_l: optionalNumber(parameterValues.mixedLiquorTss),
       return_sludge_tss_mg_l: optionalNumber(parameterValues.returnSludgeTss),
       waste_sludge_tss_mg_l: optionalNumber(parameterValues.wasteSludgeTss),
+      measured_total_energy_kwh_d: optionalNumber(parameterValues.measuredTotalEnergy),
+      measured_dry_sludge_kg_d: optionalNumber(parameterValues.measuredDrySludge),
       step_feed_fractions: stepFeedEnabled && selectedProcessType === "AO"
         ? [Number(firstStepFeedPercent) / 100, 1 - Number(firstStepFeedPercent) / 100]
         : null,
@@ -707,17 +765,15 @@ function InputPage({ navigate }: { navigate: (page: PageId) => void }) {
         ? Number(advancedTreatmentValues.filterCapture) / 100
         : 0,
       effluent_standard: standard,
+      assessment_basis: assessmentBasis,
       commissioned_before_2006: commissionedBefore2006,
       assessment_date: new Date().toISOString().slice(0, 10),
       operating_data_source: operatingDataSource,
       advanced_treatment_verified: advancedTreatmentEnabled && advancedTreatmentVerified,
-      independent_validation_passed: independentValidationPassed,
-      independent_validation_sample_count: independentValidationPassed
-        ? Number(validationValues.sampleCount)
-        : 0,
-      independent_validation_nrmse: independentValidationPassed
-        ? Number(validationValues.nrmsePercent) / 100
-        : null
+      independent_validation_passed: false,
+      independent_validation_sample_count: 0,
+      independent_validation_nrmse: null,
+      validation_record_id: null
     };
     const customLimits: EffluentLimits | undefined = standard === "custom"
       ? {
@@ -726,8 +782,8 @@ function InputPage({ navigate }: { navigate: (page: PageId) => void }) {
           tn_mg_l: Number(customLimitValues.tn),
           tp_mg_l: Number(customLimitValues.tp),
           tss_mg_l: Number(customLimitValues.tss),
-          basis: "项目实际执行的日均值",
-          source: "项目自定义排放限值"
+          basis: assessmentBasis === "instantaneous" ? "项目实际执行的瞬时值" : "项目实际执行的日均值",
+          source: "项目实际执行限值（地方标准、排污许可证与国家标准从严）"
         }
       : undefined;
     return { waterQuality, processParameters, customLimits };
@@ -764,7 +820,9 @@ function InputPage({ navigate }: { navigate: (page: PageId) => void }) {
         project.id,
         waterQuality,
         processParameters,
-        customLimits
+        customLimits,
+        influentSeries,
+        hotStart
       );
       setSimulation(result);
       setRunState("idle");
@@ -773,6 +831,29 @@ function InputPage({ navigate }: { navigate: (page: PageId) => void }) {
     } catch (error) {
       setRunState("error");
       setMessage(error instanceof Error ? error.message : "仿真失败，请检查后端服务。");
+    }
+  };
+  const importJson = async (
+    file: File | undefined,
+    kind: "influent" | "hotStart"
+  ) => {
+    if (!file) return;
+    try {
+      const parsed = JSON.parse(await file.text());
+      if (kind === "influent") {
+        if (!Array.isArray(parsed) || parsed.length < 3) {
+          throw new Error("动态进水文件至少需要三个时间点。");
+        }
+        setInfluentSeries(parsed as InfluentTimePoint[]);
+        setMessage(`已载入 ${parsed.length} 个动态进水时间点。`);
+      } else {
+        setHotStart(parsed as HotStartState);
+        setMessage("已载入热启动状态。");
+      }
+      setRunState("idle");
+    } catch (error) {
+      setRunState("error");
+      setMessage(error instanceof Error ? error.message : "文件解析失败。");
     }
   };
   const importWorkbook = async (file: File | undefined) => {
@@ -812,6 +893,15 @@ function InputPage({ navigate }: { navigate: (page: PageId) => void }) {
         </div>
       </section>
       <section className="form-section">
+        <div className="section-title"><div><h2>动态边界条件</h2><p>周期进水与已验证状态快照</p></div></div>
+        <div className="heading-actions">
+          <label className="button secondary file-button"><Upload size={17} /> 导入动态进水<input type="file" accept=".json" onChange={(event) => importJson(event.target.files?.[0], "influent")} /></label>
+          <label className="button secondary file-button"><Upload size={17} /> 导入热启动状态<input type="file" accept=".json" onChange={(event) => importJson(event.target.files?.[0], "hotStart")} /></label>
+          {influentSeries && <button className="button secondary" onClick={() => setInfluentSeries(undefined)}><X size={17} /> 清除动态进水</button>}
+          {hotStart && <button className="button secondary" onClick={() => setHotStart(undefined)}><X size={17} /> 清除热启动</button>}
+        </div>
+      </section>
+      <section className="form-section">
         <div className="section-title"><div><h2>进水实测分项组分</h2><p>用于约束总氮、总磷和可生化碳源分配；留空时仅能进行自动组分化筛选</p></div></div>
         <div className="indicator-grid">
           {[
@@ -828,20 +918,15 @@ function InputPage({ navigate }: { navigate: (page: PageId) => void }) {
       <section className="form-section">
         <div className="section-title"><div><h2>判定依据与数据来源</h2><p>排放限值和证据来源直接决定结果能否用于工程复核</p></div></div>
         <div className="form-grid three">
-          <label className="field"><span>排放判定口径</span><select value={standard} onChange={(event) => setStandard(event.target.value as typeof standard)}><option value="grade_a">国家标准一级 A（日均）</option><option value="grade_b">国家标准一级 B（日均）</option><option value="custom">项目实际执行限值</option></select><ChevronDown size={16} /></label>
+          <label className="field"><span>排放标准层级</span><select value={standard} onChange={(event) => setStandard(event.target.value as typeof standard)}><option value="grade_a">国家标准一级 A</option><option value="grade_b">国家标准一级 B</option><option value="custom">项目实际执行限值</option></select><ChevronDown size={16} /></label>
+          <label className="field"><span>判定值类型</span><select value={assessmentBasis} onChange={(event) => setAssessmentBasis(event.target.value as typeof assessmentBasis)}><option value="daily_average">日均值</option><option value="instantaneous">瞬时值</option></select><ChevronDown size={16} /></label>
           <label className="field"><span>运行参数来源</span><select value={operatingDataSource} onChange={(event) => setOperatingDataSource(event.target.value as typeof operatingDataSource)}><option value="assumed">程序默认假设</option><option value="published">公开文献数据</option><option value="design">设计或竣工资料</option><option value="measured">同期现场实测（参数完整）</option></select><ChevronDown size={16} /></label>
           <label className="field"><span>评估日期</span><input value={new Date().toLocaleDateString("zh-CN")} readOnly /></label>
         </div>
         <div className="evidence-options">
           <label><input type="checkbox" checked={commissionedBefore2006} onChange={(event) => setCommissionedBefore2006(event.target.checked)} /><span>污水厂在 2006 年前建成，按修改单过渡期处理总磷限值</span></label>
-          <label><input type="checkbox" checked={independentValidationPassed} onChange={(event) => setIndependentValidationPassed(event.target.checked)} /><span>已使用独立日期实测数据完成验证并留存记录</span></label>
         </div>
-        {independentValidationPassed && (
-          <div className="indicator-grid custom-limits">
-            <label className="indicator-field"><span>独立验证样本数</span><div><input value={validationValues.sampleCount} onChange={(event) => setValidationValues((current) => ({ ...current, sampleCount: event.target.value }))} /><b>条</b></div></label>
-            <label className="indicator-field"><span>验证归一化均方根误差</span><div><input value={validationValues.nrmsePercent} onChange={(event) => setValidationValues((current) => ({ ...current, nrmsePercent: event.target.value }))} /><b>%</b></div></label>
-          </div>
-        )}
+        <p className="form-note">独立验证状态由服务器根据校准样本和留出数据自动生成，不能人工勾选或填写。</p>
         {standard === "custom" && (
           <div className="indicator-grid custom-limits">
             {[
@@ -855,7 +940,7 @@ function InputPage({ navigate }: { navigate: (page: PageId) => void }) {
             ))}
           </div>
         )}
-        <p className="treatment-note">国家标准判定已考虑水温不高于 12 摄氏度时的氨氮限值，以及 2025 年修改单规定的总磷过渡期；地方标准和排污许可证更严格时应选择项目实际限值。</p>
+        <p className="treatment-note">国家标准判定已区分日均值与瞬时值，并考虑低温氨氮限值及总磷过渡期；瞬时值自 2026 年 3 月 1 日起适用，悬浮物不作为该表的瞬时判定项目。地方标准或排污许可证更严格时应选择项目实际执行限值。</p>
       </section>
       <section className="form-section">
         <div className="section-title treatment-heading">
@@ -918,6 +1003,12 @@ function InputPage({ navigate }: { navigate: (page: PageId) => void }) {
             ["好氧池溶解氧", "dissolvedOxygen", "mg/L"],
             ["现场传氧系数", "aerobicKla", "1/d"],
             ["氧转移效率", "oxygenTransferEfficiency", "kgO₂/kWh"],
+            ["污水传氧修正系数", "oxygenAlphaFactor", "-"],
+            ["饱和溶氧修正系数", "oxygenBetaFactor", "-"],
+            ["曝气器污堵系数", "diffuserFoulingFactor", "-"],
+            ["厂区海拔", "siteAltitude", "m"],
+            ["曝气器淹没水深", "diffuserSubmergence", "m"],
+            ["反应池实测酸碱度", "reactorPh", "-"],
             ["碱度", "alkalinity", "mg/L"],
             ["生化池总有效容积", "reactorVolume", "m³"],
             ["厌氧池有效容积", "anaerobicVolume", "m³"],
@@ -932,6 +1023,8 @@ function InputPage({ navigate }: { navigate: (page: PageId) => void }) {
             ["池内污泥浓度", "mixedLiquorTss", "mg/L"],
             ["回流污泥浓度", "returnSludgeTss", "mg/L"],
             ["排泥污泥浓度", "wasteSludgeTss", "mg/L"],
+            ["同期全厂总能耗", "measuredTotalEnergy", "kWh/d"],
+            ["同期全厂干污泥产量", "measuredDrySludge", "kg/d"],
             ["初始动态积分时长", "simulationDays", "d"],
             ["自动收敛最大时长", "maxSimulationDays", "d"]
           ].map(([name, key, unit]) => (
@@ -969,7 +1062,7 @@ function InputPage({ navigate }: { navigate: (page: PageId) => void }) {
       {message && <div className={`save-toast inline ${runState === "error" ? "error" : ""}`} role="status">{runState === "error" ? <span>!</span> : <CheckCircle2 size={17} />}{message}</div>}
       <div className="page-footer-actions">
         <span>计算将执行动态积分、排放判定、质量守恒和工程可信度检查</span>
-        <button className="button primary" onClick={runSimulation} disabled={runState === "running"}><Play size={17} fill="currentColor" /> {runState === "running" ? "正在计算..." : "运行动态仿真"}</button>
+        <button className="button primary" onClick={runSimulation} disabled={runState === "running" || !runnable.has(project?.process_type ?? "")}><Play size={17} fill="currentColor" /> {runState === "running" ? "正在计算..." : runnable.has(project?.process_type ?? "") ? "运行动态仿真" : "专用模型尚不可运行"}</button>
       </div>
     </div>
   );
@@ -1028,15 +1121,8 @@ function ResultPage({ navigate }: { navigate: (page: PageId) => void }) {
     0,
     ...relevantMappingResiduals.map(([, value]) => Math.abs(value))
   );
-  const mappingPassed = maximumMappingResidual <= 0.15;
-  const apparentRecoveryPassed = (
-    simulation.mass_balance.cod_recovery <= 1.03
-    && simulation.mass_balance.nitrogen_recovery <= 1.03
-    && (
-      simulation.mass_balance.phosphorus_recovery === null
-      || simulation.mass_balance.phosphorus_recovery <= 1.03
-    )
-  );
+  const mappingPassed = maximumMappingResidual <= simulation.quality_thresholds.component_mapping_relative_error;
+  const elementBalancePassed = simulation.mass_balance.element_balance_passed;
   const advancedTreatmentActive = Boolean(
     simulation.advanced_treatment_applied
     || (
@@ -1090,9 +1176,10 @@ function ResultPage({ navigate }: { navigate: (page: PageId) => void }) {
         nitrification_kinetic_factor: result.factors.nitrification,
         denitrification_kinetic_factor: result.factors.denitrification,
         phosphorus_kinetic_factor: result.factors.phosphorus,
-        independent_validation_passed: result.validation_passed,
-        independent_validation_sample_count: result.validation_sample_count,
-        independent_validation_nrmse: result.validation_objective
+        independent_validation_passed: result.engineering_qualified,
+        independent_validation_sample_count: result.engineering_qualified ? result.validation_sample_count : 0,
+        independent_validation_nrmse: result.engineering_qualified ? result.validation_objective : null,
+        validation_record_id: result.engineering_qualified ? result.validation_record_id : null
       };
       const recalculated = await api.simulate(project.id, influent, calibratedParameters);
       setParameters(calibratedParameters);
@@ -1112,8 +1199,10 @@ function ResultPage({ navigate }: { navigate: (page: PageId) => void }) {
         })
         .join("、");
       setCalibrationMessage(
-        result.validation_passed
-          ? `${result.method}完成：训练与独立验证的各项误差均不超过20%，验证 ${result.validation_sample_count} 条；候选因子已用完整动态模型复算当前工况。`
+        result.engineering_qualified
+          ? `${result.method}完成：训练、独立验证和现场证据均已通过，验证 ${result.validation_sample_count} 条；当前工况已用完整动态模型复算。`
+          : result.validation_passed
+          ? `${result.method}的数值验证已通过，但尚未取得工程复核资格：${result.qualification_blockers.join("、")}。当前工况按筛选级复算。`
           : result.improvement_percent > 0
           ? `${result.method}完成，但尚未通过20%逐指标验收。训练 ${result.training_sample_count} 条，验证 ${result.validation_sample_count} 条。${failedIndicators ? `超限：${failedIndicators}。` : "请补充每厂至少两条独立日期数据。"}`
           : `预校准候选参数未降低误差，已保留原参数并完成动态复算。训练 ${result.training_sample_count} 条，验证 ${result.validation_sample_count} 条。`
@@ -1134,8 +1223,8 @@ function ResultPage({ navigate }: { navigate: (page: PageId) => void }) {
       <div className="result-metrics">
         <div><Gauge size={20} /><span>综合达标率</span><strong>{complianceReady ? `${Math.round(passCount / indicatorCount * 100)}%` : "待判定"}</strong><small>{complianceReady ? `${passCount} / ${indicatorCount} 项达标` : "模型尚未满足正式判定条件"}</small></div>
         <div><Droplets size={20} /><span>预测处理水量</span><strong>{influent.flow_m3_d.toLocaleString()}</strong><small>m³/d</small></div>
-        <div><Activity size={20} /><span>运行能耗</span><strong>{simulation.energy_kwh_d.toLocaleString()}</strong><small>kWh/d</small></div>
-        <div><ClipboardCheck size={20} /><span>干污泥产量</span><strong>{simulation.sludge_kg_d.toLocaleString()}</strong><small>kg/d</small></div>
+        <div><Activity size={20} /><span>估算运行能耗</span><strong>{simulation.energy_kwh_d.toLocaleString()}</strong><small>kWh/d · {simulation.operational_estimate_evidence.energy_calibrated ? "实测校准通过" : "未通过实测校准"}</small></div>
+        <div><ClipboardCheck size={20} /><span>估算干污泥产量</span><strong>{simulation.sludge_kg_d.toLocaleString()}</strong><small>kg/d · {simulation.operational_estimate_evidence.sludge_calibrated ? "实测校准通过" : "未通过实测校准"}</small></div>
       </div>
       <section className={`reliability-panel ${simulation.reliability.score >= 60 ? "conditional" : "screening"}`}>
         <div>
@@ -1210,17 +1299,17 @@ function ResultPage({ navigate }: { navigate: (page: PageId) => void }) {
           </span>
         </div>
         <p>
-          水力闭合{simulation.mass_balance.hydraulic_relative_error <= 1e-5 ? "通过" : "未通过"}
+          水力闭合{simulation.mass_balance.hydraulic_relative_error <= simulation.quality_thresholds.hydraulic_relative_error ? "通过" : "未通过"}
           {" · "}组分重构{mappingPassed ? "通过" : `偏差 ${Math.round(maximumMappingResidual * 100)}%`}
           {" · "}表观回收{
             !simulation.convergence_reached
               ? "暂不判定"
-              : apparentRecoveryPassed ? "通过" : "未通过"
+              : elementBalancePassed ? "通过" : "未通过"
           }
           {" · "}{simulation.convergence_reached ? "达到末端准稳态判定" : "尚未达到末端准稳态判定"}
           {simulation.mass_balance.state_drift_per_d === null
             ? ""
-            : `（状态漂移 ${(simulation.mass_balance.state_drift_per_d * 100).toFixed(3)}%/天）`}
+            : `（状态漂移 ${(simulation.mass_balance.state_drift_per_d * 100).toFixed(3)}%/天，阈值 ${(simulation.quality_thresholds.state_drift_per_d * 100).toFixed(3)}%/天）`}
         </p>
         <p className="recovery-detail">
           化学需氧量 {Math.round(simulation.mass_balance.cod_recovery * 100)}%
@@ -1234,13 +1323,21 @@ function ResultPage({ navigate }: { navigate: (page: PageId) => void }) {
           {" · "}收敛检查 {simulation.convergence_attempts} 轮
           {simulation.effective_kla_d === null ? "" : ` · 有效传氧系数 ${simulation.effective_kla_d.toFixed(2)}/天`}
           {simulation.oxygen_transfer_capacity_kg_d === null ? "" : ` · 供氧能力 ${simulation.oxygen_transfer_capacity_kg_d.toFixed(1)}千克氧/天`}
+          {simulation.reactor_ph_used === null ? "" : ` · 反应池酸碱度 ${simulation.reactor_ph_used.toFixed(2)}`}
+          {simulation.alkalinity_margin_mg_l_caco3 === null ? "" : ` · 剩余碱度 ${simulation.alkalinity_margin_mg_l_caco3.toFixed(1)}毫克/升`}
           {simulation.estimated_srt_d === null ? "" : ` · 估算污泥龄 ${simulation.estimated_srt_d.toFixed(1)}天`}
           {simulation.clarifier_surface_overflow_m_d === null ? "" : ` · 二沉池表面负荷 ${simulation.clarifier_surface_overflow_m_d.toFixed(1)}米/天`}
         </p>
+        <p className="recovery-detail">
+          计算追溯 {simulation.manifest.request_sha256.slice(0, 12)}
+          {` · 程序 ${simulation.manifest.application_version}`}
+          {` · QSDsan ${simulation.manifest.qsdsan_version}`}
+          {simulation.manifest.validation_record_id ? ` · 验证记录 ${simulation.manifest.validation_record_id}` : ""}
+        </p>
       </section>
       {calibrationOpen && (
-        <section className="form-section calibration-panel">
-          <div className="section-title"><div><h2>实测出水预校准</h2><p>降阶模型拟合候选因子，当前工况随后自动使用完整动态模型复算</p></div><span>{calibrationSamples.length} 条样本</span></div>
+      <section className="form-section calibration-panel">
+          <div className="section-title"><div><h2>实测出水动态校准</h2><p>降阶模型仅生成初值，训练、候选筛选和独立验证均使用完整动态模型</p></div><span>{calibrationSamples.length} 条样本</span></div>
           <label className="field"><span>污水厂分组</span><input value={groupId} onChange={(event) => setGroupId(event.target.value)} /></label>
           <div className="indicator-grid">
             {[
@@ -1253,7 +1350,7 @@ function ResultPage({ navigate }: { navigate: (page: PageId) => void }) {
               <label className="indicator-field" key={key}><span>实测{label}</span><div><input value={measured[key as keyof typeof measured]} onChange={(event) => setMeasured((current) => ({ ...current, [key]: event.target.value }))} /><b>mg/L</b></div></label>
             ))}
           </div>
-          <div className="calibration-actions"><button className="button secondary" onClick={addCalibrationSample}><Plus size={16} /> 加入当前样本</button><button className="button primary" onClick={runCalibration} disabled={calibrationState === "running"}><SlidersHorizontal size={16} /> {calibrationState === "running" ? "预校准中..." : "执行分组预校准"}</button></div>
+          <div className="calibration-actions"><button className="button secondary" onClick={addCalibrationSample}><Plus size={16} /> 加入当前样本</button><button className="button primary" onClick={runCalibration} disabled={calibrationState === "running"}><SlidersHorizontal size={16} /> {calibrationState === "running" ? "动态校准中..." : "执行分组动态校准"}</button></div>
           {calibrationMessage && <p className={calibrationState === "error" ? "form-message error" : "form-message"}>{calibrationMessage}</p>}
         </section>
       )}
@@ -1349,6 +1446,32 @@ export function App() {
   useEffect(() => {
     if (project) localStorage.setItem("qinglan-project", JSON.stringify(project));
   }, [project]);
+  useEffect(() => {
+    if (!project?.id) return;
+    let cancelled = false;
+    Promise.all([
+      api.getProject(project.id),
+      api.listMeasurements(project.id),
+      api.listSimulations(project.id),
+      api.listSimulationJobs(project.id)
+    ]).then(([savedProject, measurements, simulations, jobs]) => {
+      if (cancelled) return;
+      setProject(savedProject);
+      if (measurements[0]) setInfluent(measurements[0].water_quality);
+      if (simulations[0]) setSimulation(simulations[0]);
+      const latestRequest = jobs.find((job) => job.request_payload)?.request_payload;
+      if (latestRequest) {
+        setParameters(latestRequest.parameters);
+        setInfluent(latestRequest.influent);
+      }
+    }).catch(() => {
+      localStorage.removeItem("qinglan-project");
+      if (!cancelled) setProject(null);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [project?.id]);
 
   const currentLabel = useMemo(() => pages.find((item) => item.id === page)?.label, [page]);
   const navigate = (next: PageId) => {

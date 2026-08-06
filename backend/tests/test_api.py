@@ -1,5 +1,6 @@
 import unittest
 import time
+from datetime import datetime
 from threading import Lock
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -8,8 +9,26 @@ from unittest.mock import Mock, patch
 from fastapi.testclient import TestClient
 
 from app.main import app
-from app.models.schemas import ProjectCreate, SimulationJobRecord, SimulationResult
+from app.models.schemas import (
+    ModelType,
+    ProcessType,
+    ProjectCreate,
+    ProjectRecord,
+    SimulationJobRecord,
+    SimulationJobStatus,
+    SimulationRequest,
+    SimulationResult,
+    ValidationRecord,
+)
+from app.api.routes import _apply_server_validation
+from app.services.simulation_job_service import (
+    cancel_simulation_job,
+    recover_simulation_jobs,
+    retry_simulation_job,
+)
 from app.services.project_service import SQLiteProjectStore
+from app.services.report_service import _compliance_label
+from backend.tests.test_models import bsm1_payload
 
 
 def fake_result(project_id: str) -> SimulationResult:
@@ -102,6 +121,95 @@ class ApiWorkflowTests(unittest.TestCase):
         self.store_patch.stop()
         self.temporary_directory.cleanup()
 
+    def test_report_compliance_label_requires_formal_decision_gate(self) -> None:
+        pending = fake_result("pending-report").model_copy(
+            update={"compliance_valid": False}
+        )
+        self.assertEqual(
+            _compliance_label(pending, True),
+            "待判定（模型证据不足）",
+        )
+        self.assertEqual(
+            _compliance_label(pending, False),
+            "待判定（模型证据不足）",
+        )
+
+        valid = pending.model_copy(update={"compliance_valid": True})
+        self.assertEqual(_compliance_label(valid, True), "达标")
+        self.assertEqual(_compliance_label(valid, False), "超标")
+
+    def test_generated_record_timestamps_are_utc_aware(self) -> None:
+        project = ProjectRecord(
+            name="时区测试",
+            plant_name="时区测试厂",
+            process_type=ProcessType.ao,
+        )
+        result = fake_result(project.id)
+        job = SimulationJobRecord(project_id=project.id)
+
+        for timestamp in (
+            project.created_at,
+            result.created_at,
+            result.manifest.generated_at,
+            job.created_at,
+        ):
+            with self.subTest(timestamp=timestamp):
+                self.assertIsNotNone(timestamp.tzinfo)
+                self.assertEqual(timestamp.utcoffset().total_seconds(), 0)
+
+    def test_independent_validation_requires_server_record(self) -> None:
+        project = self.store.create_project(
+            ProjectCreate(
+                name="验证凭证测试",
+                plant_name="验证凭证测试厂",
+                process_type=ProcessType.ao,
+            )
+        )
+        payload = bsm1_payload().model_copy(update={"project_id": project.id})
+        manual = payload.parameters.model_copy(
+            update={
+                "independent_validation_passed": True,
+                "independent_validation_sample_count": 2,
+                "independent_validation_nrmse": 0.1,
+            }
+        )
+        with self.assertRaisesRegex(Exception, "服务器生成的验证凭证"):
+            _apply_server_validation(
+                payload.model_copy(update={"parameters": manual})
+            )
+
+        record = self.store.save_validation_record(
+            ValidationRecord(
+                project_id=project.id,
+                process_type=ProcessType.ao,
+                model_type=ModelType.asm1,
+                validation_sample_count=3,
+                validation_objective=0.12,
+                validation_indicator_nrmse={"cod_mg_l": 0.1},
+                dataset_hash="a" * 64,
+                training_period_start=datetime(2026, 1, 1),
+                training_period_end=datetime(2026, 1, 3),
+                validation_period_start=datetime(2026, 1, 4),
+                validation_period_end=datetime(2026, 1, 5),
+                validation_sample_hashes=["b" * 64, "c" * 64],
+                engineering_qualified=True,
+            )
+        )
+        referenced = manual.model_copy(
+            update={
+                "independent_validation_passed": False,
+                "independent_validation_sample_count": 0,
+                "independent_validation_nrmse": None,
+                "validation_record_id": record.id,
+            }
+        )
+        verified = _apply_server_validation(
+            payload.model_copy(update={"parameters": referenced})
+        )
+        self.assertTrue(verified.parameters.independent_validation_passed)
+        self.assertEqual(verified.parameters.independent_validation_sample_count, 3)
+        self.assertEqual(verified.parameters.independent_validation_nrmse, 0.12)
+
     def test_project_and_simulation_survive_store_recreation(self) -> None:
         project = self.store.create_project(
             ProjectCreate(
@@ -117,6 +225,45 @@ class ApiWorkflowTests(unittest.TestCase):
         self.assertEqual(reopened.get_project(project.id), project)
         self.assertEqual(reopened.get_simulation(project.id), result)
 
+    def test_project_update_and_history_endpoints(self) -> None:
+        client = TestClient(app)
+        created = client.post(
+            "/api/projects",
+            json={
+                "name": "历史项目",
+                "plant_name": "历史污水厂",
+                "process_type": "AO",
+                "project_code": "HISTORY-001",
+                "design_flow_m3_d": 5000,
+            },
+        ).json()
+        updated = client.patch(
+            f"/api/projects/{created['id']}",
+            json={"name": "历史项目修订", "design_flow_m3_d": 6000},
+        )
+        self.assertEqual(updated.status_code, 200)
+        self.assertEqual(updated.json()["revision"], 2)
+        self.assertEqual(updated.json()["project_code"], "HISTORY-001")
+
+        measurement = client.post(
+            "/api/measurements",
+            json={
+                "project_id": created["id"],
+                "water_quality": self._job_request(created["id"]).influent.model_dump(),
+            },
+        )
+        self.assertEqual(measurement.status_code, 200)
+        self.store.add_simulation(fake_result(created["id"]))
+
+        measurements = client.get(
+            f"/api/projects/{created['id']}/measurements"
+        ).json()
+        simulations = client.get(
+            f"/api/projects/{created['id']}/simulations"
+        ).json()
+        self.assertEqual(len(measurements), 1)
+        self.assertEqual(len(simulations), 1)
+
     def test_simulation_job_survives_store_recreation(self) -> None:
         job = SimulationJobRecord(project_id="persistent-job")
         self.store.save_simulation_job(job)
@@ -124,6 +271,61 @@ class ApiWorkflowTests(unittest.TestCase):
         reopened = SQLiteProjectStore(self.store.database_path)
 
         self.assertEqual(reopened.get_simulation_job(job.id), job)
+
+    @staticmethod
+    def _job_request(project_id: str = "recoverable-project") -> SimulationRequest:
+        return SimulationRequest.model_validate(
+            {
+                "project_id": project_id,
+                "influent": {
+                    "flow_m3_d": 5000,
+                    "cod_mg_l": 300,
+                    "nh4_n_mg_l": 35,
+                    "tn_mg_l": 48,
+                    "tp_mg_l": 5,
+                    "tss_mg_l": 200,
+                    "ph": 7.2,
+                    "temperature_c": 20,
+                },
+            }
+        )
+
+    def test_interrupted_job_is_requeued_with_persisted_request(self) -> None:
+        job = SimulationJobRecord(
+            project_id="recoverable-project",
+            status=SimulationJobStatus.running,
+            request_payload=self._job_request(),
+            attempt_count=1,
+        )
+        self.store.save_simulation_job(job)
+        with patch("app.services.simulation_job_service._submit") as submit:
+            self.assertEqual(recover_simulation_jobs(), 1)
+        recovered = self.store.get_simulation_job(job.id)
+        self.assertEqual(recovered.status, SimulationJobStatus.queued)
+        self.assertEqual(recovered.request_payload.project_id, "recoverable-project")
+        submit.assert_called_once_with(job.id)
+
+    def test_queued_job_can_be_cancelled_and_failed_job_retried(self) -> None:
+        queued = SimulationJobRecord(
+            project_id="recoverable-project",
+            request_payload=self._job_request(),
+        )
+        self.store.save_simulation_job(queued)
+        cancelled = cancel_simulation_job(queued.id)
+        self.assertEqual(cancelled.status, SimulationJobStatus.cancelled)
+
+        failed = cancelled.model_copy(
+            update={
+                "status": SimulationJobStatus.failed,
+                "cancellation_requested": False,
+                "attempt_count": 1,
+            }
+        )
+        self.store.save_simulation_job(failed)
+        with patch("app.services.simulation_job_service._submit") as submit:
+            retried = retry_simulation_job(failed.id)
+        self.assertEqual(retried.status, SimulationJobStatus.queued)
+        submit.assert_called_once_with(failed.id)
 
     def test_background_simulation_job(self) -> None:
         client = TestClient(app)
@@ -168,6 +370,27 @@ class ApiWorkflowTests(unittest.TestCase):
         self.assertEqual(completed.json()["status"], "completed")
         self.assertEqual(completed.json()["result"]["effluent"]["tn_mg_l"], 14)
         self.assertFalse(completed.json()["result"]["applicable_indicators"]["tp"])
+
+    def test_simulation_job_idempotency_key_returns_same_job(self) -> None:
+        client = TestClient(app)
+        project = client.post(
+            "/api/projects",
+            json={
+                "name": "幂等任务测试",
+                "plant_name": "幂等任务污水厂",
+                "process_type": "AO",
+            },
+        ).json()
+        request = self._job_request(project["id"]).model_dump(mode="json")
+        headers = {"Idempotency-Key": "same-browser-submit"}
+        with patch(
+            "app.services.simulation_job_service.run_simulation_dispatch",
+            return_value=fake_result(project["id"]),
+        ):
+            first = client.post("/api/simulate/jobs", json=request, headers=headers)
+            second = client.post("/api/simulate/jobs", json=request, headers=headers)
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(first.json()["id"], second.json()["id"])
 
     def test_remote_simulation_jobs_run_in_parallel(self) -> None:
         client = TestClient(app)
@@ -270,6 +493,14 @@ class ApiWorkflowTests(unittest.TestCase):
             self.assertEqual(response.status_code, 200)
             body = response.json()
             self.assertEqual(body["status"], "ready")
+            stored = self.store.get_report_file(body["filename"])
+            self.assertIsNotNone(stored)
+            local_path = (
+                Path(__file__).resolve().parents[1]
+                / "generated_reports"
+                / body["filename"]
+            )
+            local_path.unlink(missing_ok=True)
             download = client.get(body["download_url"])
             self.assertEqual(download.status_code, 200)
             self.assertGreater(len(download.content), 1000)

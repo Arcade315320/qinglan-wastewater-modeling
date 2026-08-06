@@ -5,7 +5,42 @@ export type ProjectRecord = {
   process_type: string;
   owner: string | null;
   description: string | null;
+  project_code: string | null;
+  location: string | null;
+  modeling_period: string | null;
+  design_flow_m3_d: number | null;
   created_at: string;
+  updated_at: string | null;
+  revision: number;
+};
+
+export type MeasurementRecord = {
+  id: string;
+  project_id: string;
+  sample_time: string;
+  location: string;
+  water_quality: WaterQuality;
+};
+
+export type SimulationJobHistory = {
+  id: string;
+  project_id: string;
+  status: "queued" | "running" | "completed" | "failed" | "cancelled";
+  request_payload: {
+    influent: WaterQuality;
+    parameters: ProcessParameters;
+  } | null;
+  result: SimulationResult | null;
+  created_at: string;
+};
+
+export type ProcessCapability = {
+  process_type: string;
+  runnable: boolean;
+  status: string;
+  model_type: "ASM1" | "ASM2d" | null;
+  topology: string;
+  limitation: string | null;
 };
 
 export type WaterQuality = {
@@ -39,6 +74,12 @@ export type ProcessParameters = {
   aerobic_do_mg_l: number;
   aerobic_kla_d: number | null;
   oxygen_transfer_efficiency_kg_o2_kwh: number;
+  oxygen_alpha_factor: number;
+  oxygen_beta_factor: number;
+  diffuser_fouling_factor: number;
+  site_altitude_m: number;
+  diffuser_submergence_m: number;
+  reactor_ph: number | null;
   alkalinity_mg_l_caco3: number;
   reactor_volume_m3: number | null;
   anaerobic_volume_m3: number | null;
@@ -53,6 +94,8 @@ export type ProcessParameters = {
   mixed_liquor_tss_mg_l: number | null;
   return_sludge_tss_mg_l: number | null;
   waste_sludge_tss_mg_l: number | null;
+  measured_total_energy_kwh_d: number | null;
+  measured_dry_sludge_kg_d: number | null;
   step_feed_fractions?: number[] | null;
   simulation_days: number;
   auto_convergence: boolean;
@@ -66,6 +109,7 @@ export type ProcessParameters = {
   ferric_chloride_dose_mg_l: number;
   tertiary_filter_solids_capture: number;
   effluent_standard: "grade_a" | "grade_b" | "custom";
+  assessment_basis: "daily_average" | "instantaneous";
   commissioned_before_2006: boolean;
   assessment_date: string;
   operating_data_source: "measured" | "published" | "design" | "assumed";
@@ -73,6 +117,7 @@ export type ProcessParameters = {
   independent_validation_passed: boolean;
   independent_validation_sample_count: number;
   independent_validation_nrmse: number | null;
+  validation_record_id?: string | null;
   oxidation_ditch_channel_count?: number | null;
   oxidation_ditch_loop_volume_m3?: number | null;
   sbr_reactor_count?: number | null;
@@ -131,6 +176,19 @@ export type SimulationResult = {
   removal_rates: Record<string, number>;
   energy_kwh_d: number;
   sludge_kg_d: number;
+  operational_estimate_evidence: {
+    energy_basis: string;
+    energy_calibrated: boolean;
+    measured_energy_kwh_d: number | null;
+    energy_relative_error: number | null;
+    energy_uncertainty_relative: number;
+    sludge_basis: string;
+    sludge_calibrated: boolean;
+    measured_dry_sludge_kg_d: number | null;
+    sludge_relative_error: number | null;
+    sludge_uncertainty_relative: number;
+    calibration_tolerance_relative: number;
+  };
   compliance: Record<string, boolean>;
   applicable_indicators: Record<string, boolean>;
   compliance_valid: boolean;
@@ -142,6 +200,14 @@ export type SimulationResult = {
     nitrogen_recovery: number;
     phosphorus_recovery: number | null;
     state_drift_per_d: number | null;
+    cod_oxidation_fraction: number;
+    nitrogen_gas_fraction: number;
+    carbon_balance_relative_error: number;
+    nitrogen_balance_relative_error: number;
+    phosphorus_balance_relative_error: number | null;
+    inventory_change_relative_per_d: number | null;
+    element_balance_passed: boolean;
+    load_summary_kg_d: Record<string, number>;
     notes: string[];
   };
   component_mapping: {
@@ -149,6 +215,30 @@ export type SimulationResult = {
     concentrations_mg_l: Record<string, number>;
     reconstructed: Record<string, number>;
     relative_residuals: Record<string, number>;
+    source: string;
+    engineering_complete: boolean;
+    uncertainty_relative: number;
+    missing_measurements: string[];
+  };
+  quality_thresholds: {
+    component_mapping_relative_error: number;
+    hydraulic_relative_error: number;
+    element_balance_relative_error: number;
+    state_drift_per_d: number;
+  };
+  manifest: {
+    request_sha256: string;
+    influent_sha256: string;
+    parameters_sha256: string;
+    component_data_sha256: string | null;
+    application_version: string;
+    code_revision: string;
+    qsdsan_version: string;
+    exposan_version: string;
+    python_version: string;
+    standard_reference: string;
+    validation_record_id: string | null;
+    generated_at: string;
   };
   convergence_reached: boolean;
   simulation_days: number;
@@ -156,8 +246,14 @@ export type SimulationResult = {
   convergence_attempts: number;
   effective_kla_d: number | null;
   oxygen_transfer_capacity_kg_d: number | null;
+  corrected_oxygen_saturation_mg_l: number | null;
+  reactor_ph_used: number | null;
+  alkalinity_margin_mg_l_caco3: number | null;
   estimated_srt_d: number | null;
   clarifier_surface_overflow_m_d: number | null;
+  dynamic_influent_applied: boolean;
+  influent_profile_period_days: number | null;
+  hot_start_applied: boolean;
   assumptions: string[];
   warnings: string[];
 };
@@ -168,6 +264,18 @@ export type CalibrationSample = {
   influent: WaterQuality;
   measured: Partial<SimulationResult["effluent"]>;
   parameters: ProcessParameters;
+};
+
+export type InfluentTimePoint = {
+  elapsed_days: number;
+  water_quality: WaterQuality;
+  component_concentrations?: Record<string, number> | null;
+};
+
+export type HotStartState = {
+  model_type: "ASM1" | "ASM2d";
+  reactor_concentrations_mg_l: Record<string, number>;
+  clarifier_tss_layers_mg_l?: number[] | null;
 };
 
 const baseUrl = (import.meta.env.VITE_API_BASE_URL as string | undefined)?.replace(/\/$/, "") ?? "";
@@ -236,11 +344,32 @@ function translateValidationMessage(error: {
 }
 
 export const api = {
-  createProject(payload: Omit<ProjectRecord, "id" | "created_at">) {
+  createProject(payload: Omit<ProjectRecord, "id" | "created_at" | "updated_at" | "revision">) {
     return request<ProjectRecord>("/api/projects", {
       method: "POST",
       body: JSON.stringify(payload)
     });
+  },
+  getProject(projectId: string) {
+    return request<ProjectRecord>(`/api/projects/${projectId}`);
+  },
+  updateProject(projectId: string, payload: Partial<ProjectRecord>) {
+    return request<ProjectRecord>(`/api/projects/${projectId}`, {
+      method: "PATCH",
+      body: JSON.stringify(payload)
+    });
+  },
+  listMeasurements(projectId: string) {
+    return request<MeasurementRecord[]>(`/api/projects/${projectId}/measurements`);
+  },
+  listSimulations(projectId: string) {
+    return request<SimulationResult[]>(`/api/projects/${projectId}/simulations`);
+  },
+  listSimulationJobs(projectId: string) {
+    return request<SimulationJobHistory[]>(`/api/projects/${projectId}/simulation-jobs`);
+  },
+  listProcessCapabilities() {
+    return request<ProcessCapability[]>("/api/models/capabilities");
   },
   createMeasurement(projectId: string, waterQuality: WaterQuality) {
     return request("/api/measurements", {
@@ -256,21 +385,26 @@ export const api = {
     projectId: string,
     influent: WaterQuality,
     parameters: ProcessParameters,
-    customLimits?: EffluentLimits
+    customLimits?: EffluentLimits,
+    influentSeries?: InfluentTimePoint[],
+    hotStart?: HotStartState
   ) {
     type SimulationJob = {
       id: string;
-      status: "queued" | "running" | "completed" | "failed";
+      status: "queued" | "running" | "completed" | "failed" | "cancelled";
       result: SimulationResult | null;
       error: string | null;
     };
     return request<SimulationJob>("/api/simulate/jobs", {
       method: "POST",
+      headers: { "Idempotency-Key": crypto.randomUUID() },
       body: JSON.stringify({
         project_id: projectId,
         influent,
         parameters,
-        custom_limits: customLimits
+        custom_limits: customLimits,
+        influent_series: influentSeries,
+        hot_start: hotStart
       })
     }).then(async (job) => {
       for (let attempt = 0; attempt < 450; attempt += 1) {
@@ -278,7 +412,7 @@ export const api = {
           ? job
           : await request<SimulationJob>(`/api/simulate/jobs/${job.id}`);
         if (current.status === "completed" && current.result) return current.result;
-        if (current.status === "failed") {
+        if (current.status === "failed" || current.status === "cancelled") {
           throw new Error(current.error ?? "动态仿真失败。");
         }
         await new Promise((resolve) => window.setTimeout(resolve, 2000));
@@ -295,6 +429,9 @@ export const api = {
       validation_passed: boolean;
       calibration_passed: boolean;
       validation_indicator_nrmse: Record<string, number>;
+      validation_record_id: string | null;
+      engineering_qualified: boolean;
+      qualification_blockers: string[];
       improvement_percent: number;
       warnings: string[];
       method: string;

@@ -1,6 +1,5 @@
 import json
 import sqlite3
-from datetime import datetime
 from pathlib import Path
 from threading import RLock
 
@@ -9,11 +8,14 @@ from app.models.schemas import (
     MeasurementRecord,
     ProjectCreate,
     ProjectRecord,
+    ProjectUpdate,
     SimulationResult,
     SimulationJobRecord,
     SimulationJobStatus,
+    ValidationRecord,
 )
 from app.core.config import settings
+from app.core.time import utc_now
 
 
 DEFAULT_DATABASE_PATH = (
@@ -74,12 +76,27 @@ class SQLiteProjectStore:
                 );
                 CREATE INDEX IF NOT EXISTS simulation_jobs_project_time
                     ON simulation_jobs(project_id, created_at);
+                CREATE TABLE IF NOT EXISTS validation_records (
+                    id TEXT PRIMARY KEY,
+                    project_id TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    data TEXT NOT NULL,
+                    FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE
+                );
+                CREATE INDEX IF NOT EXISTS validation_records_project_time
+                    ON validation_records(project_id, created_at);
+                CREATE TABLE IF NOT EXISTS report_files (
+                    filename TEXT PRIMARY KEY,
+                    content_type TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    data BLOB NOT NULL
+                );
                 """
             )
 
     @staticmethod
     def _serialize(
-        record: ProjectRecord | MeasurementRecord | SimulationResult | SimulationJobRecord,
+        record: ProjectRecord | MeasurementRecord | SimulationResult | SimulationJobRecord | ValidationRecord,
     ) -> str:
         return json.dumps(record.model_dump(mode="json"), ensure_ascii=False)
 
@@ -98,6 +115,22 @@ class SQLiteProjectStore:
 
     def create_project(self, payload: ProjectCreate) -> ProjectRecord:
         return self.save_project(ProjectRecord(**payload.model_dump()))
+
+    def update_project(
+        self, project_id: str, payload: ProjectUpdate
+    ) -> ProjectRecord | None:
+        current = self.get_project(project_id)
+        if current is None:
+            return None
+        changes = payload.model_dump(exclude_unset=True)
+        updated = current.model_copy(
+            update={
+                **changes,
+                "updated_at": utc_now(),
+                "revision": current.revision + 1,
+            }
+        )
+        return self.save_project(updated)
 
     def list_projects(self) -> list[ProjectRecord]:
         with self._lock, self._connect() as connection:
@@ -126,6 +159,14 @@ class SQLiteProjectStore:
                 ),
             )
         return measurement
+
+    def list_measurements(self, project_id: str) -> list[MeasurementRecord]:
+        with self._lock, self._connect() as connection:
+            rows = connection.execute(
+                "SELECT data FROM measurements WHERE project_id = ? ORDER BY sample_time DESC",
+                (project_id,),
+            ).fetchall()
+        return [MeasurementRecord.model_validate(json.loads(row["data"])) for row in rows]
 
     def get_project(self, project_id: str) -> ProjectRecord | None:
         with self._lock, self._connect() as connection:
@@ -174,6 +215,14 @@ class SQLiteProjectStore:
                 ).fetchone()
         return SimulationResult.model_validate(json.loads(row["data"])) if row else None
 
+    def list_simulations(self, project_id: str) -> list[SimulationResult]:
+        with self._lock, self._connect() as connection:
+            rows = connection.execute(
+                "SELECT data FROM simulations WHERE project_id = ? ORDER BY created_at DESC",
+                (project_id,),
+            ).fetchall()
+        return [SimulationResult.model_validate(json.loads(row["data"])) for row in rows]
+
     def save_simulation_job(self, job: SimulationJobRecord) -> SimulationJobRecord:
         with self._lock, self._connect() as connection:
             connection.execute(
@@ -204,25 +253,197 @@ class SQLiteProjectStore:
             ).fetchone()
         return SimulationJobRecord.model_validate(json.loads(row["data"])) if row else None
 
-    def fail_interrupted_simulation_jobs(self) -> int:
+    def list_recoverable_simulation_jobs(self) -> list[SimulationJobRecord]:
         with self._lock, self._connect() as connection:
             rows = connection.execute(
                 "SELECT data FROM simulation_jobs WHERE status IN (?, ?)",
                 (SimulationJobStatus.queued.value, SimulationJobStatus.running.value),
             ).fetchall()
-            for row in rows:
-                job = SimulationJobRecord.model_validate(json.loads(row["data"]))
-                self.save_simulation_job(
-                    job.model_copy(
-                        update={
-                            "status": SimulationJobStatus.failed,
-                            "error": "服务重启中断了尚未完成的动态仿真，请重新提交。",
-                            "completed_at": datetime.utcnow(),
-                        }
-                    )
-                )
-        return len(rows)
+        return [SimulationJobRecord.model_validate(json.loads(row["data"])) for row in rows]
+
+    def list_simulation_jobs(self, project_id: str) -> list[SimulationJobRecord]:
+        with self._lock, self._connect() as connection:
+            rows = connection.execute(
+                "SELECT data FROM simulation_jobs WHERE project_id = ? ORDER BY created_at DESC",
+                (project_id,),
+            ).fetchall()
+        return [SimulationJobRecord.model_validate(json.loads(row["data"])) for row in rows]
+
+    def get_simulation_job_by_idempotency_key(
+        self, idempotency_key: str
+    ) -> SimulationJobRecord | None:
+        with self._lock, self._connect() as connection:
+            rows = connection.execute(
+                "SELECT data FROM simulation_jobs ORDER BY created_at DESC"
+            ).fetchall()
+        for row in rows:
+            job = SimulationJobRecord.model_validate(json.loads(row["data"]))
+            if job.idempotency_key == idempotency_key:
+                return job
+        return None
+
+    def claim_simulation_job(self, job_id: str) -> SimulationJobRecord | None:
+        with self._lock, self._connect() as connection:
+            row = connection.execute(
+                "SELECT data FROM simulation_jobs WHERE id = ?", (job_id,)
+            ).fetchone()
+            if row is None:
+                return None
+            job = SimulationJobRecord.model_validate(json.loads(row["data"]))
+            if job.status != SimulationJobStatus.queued or job.cancellation_requested:
+                return None
+            claimed = job.model_copy(
+                update={
+                    "status": SimulationJobStatus.running,
+                    "attempt_count": job.attempt_count + 1,
+                    "progress_percent": 5,
+                    "started_at": utc_now(),
+                    "completed_at": None,
+                    "error": None,
+                }
+            )
+            cursor = connection.execute(
+                """
+                UPDATE simulation_jobs
+                SET status = ?, data = ?
+                WHERE id = ? AND status = ?
+                """,
+                (
+                    SimulationJobStatus.running.value,
+                    self._serialize(claimed),
+                    job_id,
+                    SimulationJobStatus.queued.value,
+                ),
+            )
+            if getattr(cursor, "rowcount", 1) != 1:
+                return None
+        return claimed
+
+    def save_validation_record(self, record: ValidationRecord) -> ValidationRecord:
+        with self._lock, self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO validation_records(id, project_id, created_at, data)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    project_id = excluded.project_id,
+                    created_at = excluded.created_at,
+                    data = excluded.data
+                """,
+                (
+                    record.id,
+                    record.project_id,
+                    record.created_at.isoformat(),
+                    self._serialize(record),
+                ),
+            )
+        return record
+
+    def get_validation_record(
+        self, project_id: str, record_id: str
+    ) -> ValidationRecord | None:
+        with self._lock, self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT data FROM validation_records
+                WHERE project_id = ? AND id = ?
+                """,
+                (project_id, record_id),
+            ).fetchone()
+        return ValidationRecord.model_validate(json.loads(row["data"])) if row else None
+
+    def list_validation_records(self, project_id: str) -> list[ValidationRecord]:
+        with self._lock, self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT data FROM validation_records
+                WHERE project_id = ? ORDER BY created_at DESC
+                """,
+                (project_id,),
+            ).fetchall()
+        return [
+            ValidationRecord.model_validate(json.loads(row["data"]))
+            for row in rows
+        ]
+
+    def save_report_file(
+        self, filename: str, content_type: str, data: bytes
+    ) -> None:
+        with self._lock, self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO report_files(filename, content_type, created_at, data)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(filename) DO UPDATE SET
+                    content_type = excluded.content_type,
+                    created_at = excluded.created_at,
+                    data = excluded.data
+                """,
+                (filename, content_type, utc_now().isoformat(), data),
+            )
+
+    def get_report_file(self, filename: str) -> tuple[str, bytes] | None:
+        with self._lock, self._connect() as connection:
+            row = connection.execute(
+                "SELECT content_type, data FROM report_files WHERE filename = ?",
+                (filename,),
+            ).fetchone()
+        return (row["content_type"], bytes(row["data"])) if row else None
+
+class _PostgreSQLConnectionAdapter:
+    def __init__(self, connection) -> None:
+        self.connection = connection
+
+    @staticmethod
+    def _sql(statement: str) -> str:
+        return statement.replace("?", "%s")
+
+    def execute(self, statement: str, parameters=()):
+        if statement.lstrip().upper().startswith("PRAGMA "):
+            return self.connection.execute("SELECT 1")
+        return self.connection.execute(self._sql(statement), parameters)
+
+    def executescript(self, script: str) -> None:
+        postgres_script = script.replace(" BLOB ", " BYTEA ")
+        for statement in postgres_script.split(";"):
+            if statement.strip():
+                self.connection.execute(statement)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        try:
+            if exc_type is None:
+                self.connection.commit()
+            else:
+                self.connection.rollback()
+        finally:
+            self.connection.close()
 
 
-project_store = SQLiteProjectStore()
-project_store.fail_interrupted_simulation_jobs()
+class PostgreSQLProjectStore(SQLiteProjectStore):
+    def __init__(self, database_url: str) -> None:
+        self.database_url = database_url
+        self._lock = RLock()
+        self._initialize()
+
+    def _connect(self) -> _PostgreSQLConnectionAdapter:
+        try:
+            import psycopg
+            from psycopg.rows import dict_row
+        except ImportError as error:
+            raise RuntimeError(
+                "DATABASE_URL已配置，但未安装PostgreSQL数据库驱动。"
+            ) from error
+        connection = psycopg.connect(self.database_url, row_factory=dict_row)
+        return _PostgreSQLConnectionAdapter(connection)
+
+
+def create_project_store():
+    if settings.database_url:
+        return PostgreSQLProjectStore(settings.database_url)
+    return SQLiteProjectStore()
+
+
+project_store = create_project_store()

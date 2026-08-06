@@ -2,6 +2,8 @@ from datetime import date, datetime
 from enum import StrEnum
 from uuid import uuid4
 
+from app.core.time import utc_now
+
 from pydantic import BaseModel, Field, model_validator
 
 
@@ -35,6 +37,11 @@ class EffluentStandard(StrEnum):
     grade_a = "grade_a"
     grade_b = "grade_b"
     custom = "custom"
+
+
+class EffluentAssessmentBasis(StrEnum):
+    daily_average = "daily_average"
+    instantaneous = "instantaneous"
 
 
 class OperatingDataSource(StrEnum):
@@ -112,6 +119,12 @@ class ProcessParameters(BaseModel):
     aerobic_do_mg_l: float = Field(default=2.0, ge=0, le=14)
     aerobic_kla_d: float | None = Field(default=None, gt=0, le=1000)
     oxygen_transfer_efficiency_kg_o2_kwh: float = Field(default=1.5, gt=0, le=5)
+    oxygen_alpha_factor: float = Field(default=0.80, gt=0, le=1)
+    oxygen_beta_factor: float = Field(default=0.95, gt=0, le=1)
+    diffuser_fouling_factor: float = Field(default=0.90, gt=0, le=1)
+    site_altitude_m: float = Field(default=0, ge=0, le=5000)
+    diffuser_submergence_m: float = Field(default=4.0, gt=0, le=15)
+    reactor_ph: float | None = Field(default=None, ge=4, le=10)
     alkalinity_mg_l_caco3: float = Field(default=250, ge=0)
     clarifier_solids_capture: float = Field(default=0.98, ge=0, le=1)
     reactor_volume_m3: float | None = Field(default=None, gt=0)
@@ -127,6 +140,8 @@ class ProcessParameters(BaseModel):
     mixed_liquor_tss_mg_l: float | None = Field(default=None, gt=0)
     return_sludge_tss_mg_l: float | None = Field(default=None, gt=0)
     waste_sludge_tss_mg_l: float | None = Field(default=None, gt=0)
+    measured_total_energy_kwh_d: float | None = Field(default=None, gt=0)
+    measured_dry_sludge_kg_d: float | None = Field(default=None, gt=0)
     step_feed_fractions: list[float] | None = None
     cod_kinetic_factor: float = Field(default=1.0, ge=0.1, le=5.0)
     nitrification_kinetic_factor: float = Field(default=1.0, ge=0.1, le=5.0)
@@ -140,6 +155,7 @@ class ProcessParameters(BaseModel):
     max_simulation_days: float = Field(default=100, ge=5, le=365)
     convergence_tolerance_per_d: float = Field(default=0.01, gt=0, le=0.05)
     effluent_standard: EffluentStandard = EffluentStandard.grade_a
+    assessment_basis: EffluentAssessmentBasis = EffluentAssessmentBasis.daily_average
     commissioned_before_2006: bool = False
     assessment_date: date = Field(default_factory=date.today)
     operating_data_source: OperatingDataSource = OperatingDataSource.assumed
@@ -147,6 +163,7 @@ class ProcessParameters(BaseModel):
     independent_validation_passed: bool = False
     independent_validation_sample_count: int = Field(default=0, ge=0, le=10000)
     independent_validation_nrmse: float | None = Field(default=None, ge=0)
+    validation_record_id: str | None = None
     oxidation_ditch_channel_count: int | None = Field(default=None, ge=1, le=20)
     oxidation_ditch_loop_volume_m3: float | None = Field(default=None, gt=0)
     sbr_reactor_count: int | None = Field(default=None, ge=1, le=20)
@@ -278,16 +295,34 @@ class ProjectCreate(BaseModel):
     process_type: ProcessType = ProcessType.aao
     owner: str | None = None
     description: str | None = None
+    project_code: str | None = None
+    location: str | None = None
+    modeling_period: str | None = None
+    design_flow_m3_d: float | None = Field(default=None, gt=0)
+
+
+class ProjectUpdate(BaseModel):
+    name: str | None = Field(default=None, min_length=1)
+    plant_name: str | None = Field(default=None, min_length=1)
+    process_type: ProcessType | None = None
+    owner: str | None = None
+    description: str | None = None
+    project_code: str | None = None
+    location: str | None = None
+    modeling_period: str | None = None
+    design_flow_m3_d: float | None = Field(default=None, gt=0)
 
 
 class ProjectRecord(ProjectCreate):
     id: str = Field(default_factory=lambda: str(uuid4()))
-    created_at: datetime = Field(default_factory=datetime.utcnow)
+    created_at: datetime = Field(default_factory=utc_now)
+    updated_at: datetime | None = None
+    revision: int = Field(default=1, ge=1)
 
 
 class MeasurementCreate(BaseModel):
     project_id: str
-    sample_time: datetime = Field(default_factory=datetime.utcnow)
+    sample_time: datetime = Field(default_factory=utc_now)
     location: str = "influent"
     water_quality: WaterQuality
 
@@ -296,12 +331,41 @@ class MeasurementRecord(MeasurementCreate):
     id: str = Field(default_factory=lambda: str(uuid4()))
 
 
+class InfluentTimePoint(BaseModel):
+    elapsed_days: float = Field(ge=0)
+    water_quality: WaterQuality
+    component_concentrations: dict[str, float] | None = None
+
+
+class HotStartState(BaseModel):
+    model_type: ModelType
+    reactor_concentrations_mg_l: dict[str, float] = Field(min_length=1)
+    clarifier_tss_layers_mg_l: list[float] | None = Field(
+        default=None, min_length=10, max_length=10
+    )
+
+    @model_validator(mode="after")
+    def validate_nonnegative_state(self):
+        if any(value < 0 for value in self.reactor_concentrations_mg_l.values()):
+            raise ValueError("热启动反应池组分浓度不能为负值。")
+        if self.clarifier_tss_layers_mg_l is not None and any(
+            value < 0 for value in self.clarifier_tss_layers_mg_l
+        ):
+            raise ValueError("热启动二沉池各层污泥浓度不能为负值。")
+        return self
+
+
 class SimulationRequest(BaseModel):
     project_id: str
     influent: WaterQuality
     parameters: ProcessParameters = Field(default_factory=ProcessParameters)
     component_concentrations: dict[str, float] | None = None
+    component_data_source: OperatingDataSource = OperatingDataSource.assumed
     custom_limits: EffluentLimits | None = None
+    influent_series: list[InfluentTimePoint] | None = Field(
+        default=None, min_length=3, max_length=1000
+    )
+    hot_start: HotStartState | None = None
 
     @model_validator(mode="after")
     def require_custom_limits(self):
@@ -312,6 +376,35 @@ class SimulationRequest(BaseModel):
             raise ValueError("选择自定义排放限值时必须填写全部五项限值。")
         params = self.parameters
         water = self.influent
+        if self.influent_series is not None:
+            times = [point.elapsed_days for point in self.influent_series]
+            if times[0] != 0:
+                raise ValueError("动态进水序列必须从第0天开始。")
+            if any(current <= previous for previous, current in zip(times, times[1:])):
+                raise ValueError("动态进水时间点必须严格递增且不能重复。")
+            if times[-1] > params.simulation_days:
+                raise ValueError("动态进水首个周期不能长于初始动态积分时长。")
+            temperatures = [point.water_quality.temperature_c for point in self.influent_series]
+            if max(temperatures) - min(temperatures) > 0.01:
+                raise ValueError("当前动力学参数仅支持周期内恒定水温，请按水温分段运行。")
+            first = self.influent_series[0].water_quality
+            comparable_fields = (
+                "flow_m3_d", "cod_mg_l", "nh4_n_mg_l", "tn_mg_l",
+                "tp_mg_l", "tss_mg_l", "ph", "temperature_c",
+            )
+            if any(
+                abs(float(getattr(first, name)) - float(getattr(water, name))) > 1e-6
+                for name in comparable_fields
+            ):
+                raise ValueError("动态进水第0天数据必须与基础进水数据一致。")
+            last = self.influent_series[-1].water_quality
+            if any(
+                abs(float(getattr(first, name)) - float(getattr(last, name))) > 1e-6
+                for name in comparable_fields
+            ):
+                raise ValueError("动态进水末端数据必须与第0天一致，以形成明确周期。")
+        if self.hot_start is not None and self.hot_start.model_type != params.model_type:
+            raise ValueError("热启动状态的模型类型必须与本次仿真模型一致。")
         if params.reactor_volume_m3 is not None:
             calculated_hrt = params.reactor_volume_m3 / water.flow_m3_d * 24
             tolerance = 0.05 if params.operating_data_source == OperatingDataSource.measured else 0.10
@@ -400,6 +493,10 @@ class ComponentMappingResult(BaseModel):
     concentrations_mg_l: dict[str, float]
     reconstructed: dict[str, float]
     relative_residuals: dict[str, float]
+    source: str = "程序默认假设"
+    engineering_complete: bool = False
+    uncertainty_relative: float = 0.35
+    missing_measurements: list[str] = Field(default_factory=list)
 
 
 class MassBalanceResult(BaseModel):
@@ -409,6 +506,14 @@ class MassBalanceResult(BaseModel):
     nitrogen_recovery: float
     phosphorus_recovery: float | None = None
     state_drift_per_d: float | None = None
+    cod_oxidation_fraction: float = 0.0
+    nitrogen_gas_fraction: float = 0.0
+    carbon_balance_relative_error: float = 0.0
+    nitrogen_balance_relative_error: float = 0.0
+    phosphorus_balance_relative_error: float | None = None
+    inventory_change_relative_per_d: float | None = None
+    element_balance_passed: bool = False
+    load_summary_kg_d: dict[str, float] = Field(default_factory=dict)
     notes: list[str] = Field(default_factory=list)
 
 
@@ -420,9 +525,45 @@ class ReliabilityAssessment(BaseModel):
     blockers: list[str] = Field(default_factory=list)
 
 
+class QualityThresholds(BaseModel):
+    component_mapping_relative_error: float = 0.05
+    hydraulic_relative_error: float = 1e-5
+    element_balance_relative_error: float = 0.03
+    state_drift_per_d: float = 0.01
+
+
+class OperationalEstimateEvidence(BaseModel):
+    energy_basis: str = "设备额定功率与运行时长估算"
+    energy_calibrated: bool = False
+    measured_energy_kwh_d: float | None = None
+    energy_relative_error: float | None = None
+    energy_uncertainty_relative: float = 0.35
+    sludge_basis: str = "模型排泥流干固体估算"
+    sludge_calibrated: bool = False
+    measured_dry_sludge_kg_d: float | None = None
+    sludge_relative_error: float | None = None
+    sludge_uncertainty_relative: float = 0.40
+    calibration_tolerance_relative: float = 0.20
+
+
+class SimulationManifest(BaseModel):
+    request_sha256: str = ""
+    influent_sha256: str = ""
+    parameters_sha256: str = ""
+    component_data_sha256: str | None = None
+    application_version: str = ""
+    code_revision: str = "未提供部署提交号"
+    qsdsan_version: str = ""
+    exposan_version: str = ""
+    python_version: str = ""
+    standard_reference: str = ""
+    validation_record_id: str | None = None
+    generated_at: datetime = Field(default_factory=utc_now)
+
+
 class SimulationResult(BaseModel):
     simulation_id: str = Field(default_factory=lambda: str(uuid4()))
-    created_at: datetime = Field(default_factory=datetime.utcnow)
+    created_at: datetime = Field(default_factory=utc_now)
     project_id: str
     model_id: ModelType
     engine: str
@@ -434,6 +575,9 @@ class SimulationResult(BaseModel):
     removal_rates: RemovalRates
     energy_kwh_d: float
     sludge_kg_d: float
+    operational_estimate_evidence: OperationalEstimateEvidence = Field(
+        default_factory=OperationalEstimateEvidence
+    )
     compliance: dict[str, bool]
     applicable_indicators: dict[str, bool] = Field(
         default_factory=lambda: {
@@ -448,14 +592,22 @@ class SimulationResult(BaseModel):
     model_note: str
     component_mapping: ComponentMappingResult
     mass_balance: MassBalanceResult
+    quality_thresholds: QualityThresholds = Field(default_factory=QualityThresholds)
+    manifest: SimulationManifest = Field(default_factory=SimulationManifest)
     convergence_reached: bool
     simulation_days: float
     requested_simulation_days: float | None = None
     convergence_attempts: int = 1
     effective_kla_d: float | None = None
     oxygen_transfer_capacity_kg_d: float | None = None
+    corrected_oxygen_saturation_mg_l: float | None = None
+    reactor_ph_used: float | None = None
+    alkalinity_margin_mg_l_caco3: float | None = None
     estimated_srt_d: float | None = None
     clarifier_surface_overflow_m_d: float | None = None
+    dynamic_influent_applied: bool = False
+    influent_profile_period_days: float | None = None
+    hot_start_applied: bool = False
     assumptions: list[str] = Field(default_factory=list)
     warnings: list[str] = Field(default_factory=list)
 
@@ -465,6 +617,7 @@ class SimulationJobStatus(StrEnum):
     running = "running"
     completed = "completed"
     failed = "failed"
+    cancelled = "cancelled"
 
 
 class SimulationJobRecord(BaseModel):
@@ -473,7 +626,14 @@ class SimulationJobRecord(BaseModel):
     status: SimulationJobStatus = SimulationJobStatus.queued
     result: SimulationResult | None = None
     error: str | None = None
-    created_at: datetime = Field(default_factory=datetime.utcnow)
+    request_payload: SimulationRequest | None = None
+    idempotency_key: str | None = None
+    attempt_count: int = Field(default=0, ge=0)
+    max_attempts: int = Field(default=2, ge=1, le=5)
+    progress_percent: int = Field(default=0, ge=0, le=100)
+    cancellation_requested: bool = False
+    created_at: datetime = Field(default_factory=utc_now)
+    started_at: datetime | None = None
     completed_at: datetime | None = None
 
 
@@ -486,6 +646,15 @@ class ModelInfo(BaseModel):
     required_inputs: list[str]
     source: str
     reference: str
+
+
+class ProcessCapability(BaseModel):
+    process_type: ProcessType
+    runnable: bool
+    status: str
+    model_type: ModelType | None = None
+    topology: str
+    limitation: str | None = None
 
 
 class ModelEngineStatus(BaseModel):
@@ -535,7 +704,7 @@ class PartialEffluentMeasurement(BaseModel):
 
 class ModelCalibrationSample(BaseModel):
     group_id: str = "default"
-    sample_time: datetime = Field(default_factory=datetime.utcnow)
+    sample_time: datetime = Field(default_factory=utc_now)
     influent: WaterQuality
     measured: PartialEffluentMeasurement
     parameters: ProcessParameters = Field(default_factory=ProcessParameters)
@@ -581,9 +750,38 @@ class ModelCalibrationResult(BaseModel):
     validation_passed: bool = False
     calibration_passed: bool = False
     validation_indicator_nrmse: dict[str, float] = Field(default_factory=dict)
+    validation_record_id: str | None = None
+    dataset_hash: str | None = None
+    training_period_start: datetime | None = None
+    training_period_end: datetime | None = None
+    validation_period_start: datetime | None = None
+    validation_period_end: datetime | None = None
+    validation_sample_hashes: list[str] = Field(default_factory=list)
+    engineering_qualified: bool = False
+    qualification_blockers: list[str] = Field(default_factory=list)
     method: str = "降阶模型预校准"
     recommendation: str
     warnings: list[str] = Field(default_factory=list)
+
+
+class ValidationRecord(BaseModel):
+    id: str = Field(default_factory=lambda: str(uuid4()))
+    created_at: datetime = Field(default_factory=utc_now)
+    project_id: str
+    process_type: ProcessType
+    model_type: ModelType
+    validation_sample_count: int = Field(ge=2)
+    validation_objective: float = Field(ge=0)
+    validation_indicator_nrmse: dict[str, float]
+    dataset_hash: str
+    training_period_start: datetime
+    training_period_end: datetime
+    validation_period_start: datetime
+    validation_period_end: datetime
+    validation_sample_hashes: list[str] = Field(min_length=2)
+    passed: bool = True
+    engineering_qualified: bool = False
+    qualification_blockers: list[str] = Field(default_factory=list)
 
 
 class CalibrationImportResult(BaseModel):

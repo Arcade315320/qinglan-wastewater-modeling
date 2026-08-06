@@ -3,6 +3,6 @@
 # QSDsan/EXPOsan 1.5.3 require the current scientific stack on Python 3.12.
 qsdsan==1.5.3
 exposan==1.5.3
-numpy>=2.3.5,<2.5
-pandas>=2.3,<3
-scipy>=1.15,<1.16
+numpy==2.4.6
+pandas==2.3.3
+scipy==1.15.3

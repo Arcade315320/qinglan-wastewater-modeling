@@ -1,24 +1,33 @@
 import math
+import os
 import platform
+import tempfile
 from contextlib import contextmanager
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from threading import Lock
 
+from app.core.warning_policy import model_dependency_import_context
 from app.models.schemas import (
     ComponentMappingResult,
     EffluentPrediction,
     MassBalanceResult,
     ModelEngineStatus,
     ModelType,
+    OperatingDataSource,
     ProcessType,
     SimulationRequest,
+)
+from app.services.quality_policy import (
+    COMPONENT_MAPPING_RELATIVE_ERROR,
+    ELEMENT_BALANCE_RELATIVE_ERROR,
+    HYDRAULIC_RELATIVE_ERROR,
 )
 
 
 _MODEL_LOCK = Lock()
 MIN_DYNAMIC_MEMORY_BYTES = 1024**3
-MASS_RECOVERY_UPPER_BOUND = 1.03
+ELEMENT_BALANCE_TOLERANCE = ELEMENT_BALANCE_RELATIVE_ERROR
 DENITRIFICATION_COD_PER_N = 4.0
 FERRIC_CHLORIDE_MOLAR_MASS = 162.2
 PHOSPHORUS_MOLAR_MASS = 30.974
@@ -26,7 +35,7 @@ FERRIC_TO_PHOSPHORUS_MOLAR_RATIO = 1.5
 CHEMICAL_PHOSPHORUS_EFFICIENCY = 0.90
 TERTIARY_FILTER_ENERGY_KWH_M3 = 0.04
 STEADY_STATE_DRIFT_PER_DAY = 0.01
-COMPONENT_MAPPING_TOLERANCE = 0.05
+COMPONENT_MAPPING_TOLERANCE = COMPONENT_MAPPING_RELATIVE_ERROR
 ASM_REFERENCE_TEMPERATURE_C = {
     ModelType.asm1: 20.0,
     ModelType.asm2d: 15.0,
@@ -49,6 +58,22 @@ ZONE_FRACTIONS: dict[ProcessType, tuple[float, float, float]] = {
     ProcessType.contact_oxidation: (0.0, 0.15, 0.85),
     ProcessType.uasb_ao: (0.45, 0.15, 0.40),
     ProcessType.custom: (0.10, 0.25, 0.65),
+}
+
+MODEL_COMPONENT_IDS = {
+    ModelType.asm1: {
+        "S_I", "S_S", "X_I", "X_S", "X_BH", "X_BA", "X_P", "S_O",
+        "S_NO", "S_NH", "S_ND", "X_ND", "S_ALK", "S_N2",
+    },
+    ModelType.asm2d: {
+        "S_O2", "S_N2", "S_NH4", "S_NO3", "S_PO4", "S_F", "S_A", "S_I",
+        "S_ALK", "X_I", "X_S", "X_H", "X_PAO", "X_PP", "X_PHA", "X_AUT",
+    },
+}
+
+REQUIRED_MEASURED_COMPONENTS = {
+    ModelType.asm1: {"S_I", "S_S", "X_I", "X_S", "X_BH", "S_NH", "S_ND", "X_ND", "S_ALK"},
+    ModelType.asm2d: {"S_I", "S_F", "S_A", "X_I", "X_S", "X_H", "S_NH4", "S_NO3", "S_PO4", "S_ALK"},
 }
 
 
@@ -231,7 +256,25 @@ def _bulk_components(payload: SimulationRequest) -> tuple[dict[str, float], str]
             for key, value in payload.component_concentrations.items()
         }
         if any(value < 0 for value in values.values()):
-            raise ValueError("Component concentrations cannot be negative.")
+            raise ValueError("模型组分浓度不能为负值。")
+        allowed = MODEL_COMPONENT_IDS[payload.parameters.model_type]
+        unknown = set(values) - allowed
+        if unknown:
+            raise ValueError(
+                f"{payload.parameters.model_type.value}不包含以下组分："
+                + "、".join(sorted(unknown))
+            )
+        required = set(REQUIRED_MEASURED_COMPONENTS[payload.parameters.model_type])
+        nox = (payload.influent.nitrate_n_mg_l or 0) + (payload.influent.nitrite_n_mg_l or 0)
+        if payload.parameters.model_type == ModelType.asm1 and nox > 0:
+            required.add("S_NO")
+        missing = required - set(values)
+        if missing:
+            raise ValueError(
+                "用户组分数据不完整，缺少：" + "、".join(sorted(missing))
+            )
+        for component_id in allowed:
+            values.setdefault(component_id, 0.0)
         return values, "用户提供的模型组分"
 
     water = payload.influent
@@ -359,15 +402,64 @@ def _bulk_components(payload: SimulationRequest) -> tuple[dict[str, float], str]
     return values, mapping_method
 
 
+def _mapping_evidence(
+    payload: SimulationRequest, mapping_method: str
+) -> dict[str, object]:
+    water = payload.influent
+    if payload.component_concentrations is not None:
+        source_labels = {
+            OperatingDataSource.measured: "同期实测模型组分",
+            OperatingDataSource.published: "公开资料模型组分",
+            OperatingDataSource.design: "设计资料模型组分",
+            OperatingDataSource.assumed: "未核实的用户组分",
+        }
+        uncertainty = {
+            OperatingDataSource.measured: 0.05,
+            OperatingDataSource.published: 0.15,
+            OperatingDataSource.design: 0.20,
+            OperatingDataSource.assumed: 0.35,
+        }[payload.component_data_source]
+        complete = payload.component_data_source == OperatingDataSource.measured
+        return {
+            "source": source_labels[payload.component_data_source],
+            "engineering_complete": complete,
+            "uncertainty_relative": uncertainty,
+            "missing_measurements": [] if complete else ["模型组分同期实测来源证明"],
+        }
+
+    required_fields = {
+        "溶解性化学需氧量": water.soluble_cod_mg_l,
+        "硝态氮": water.nitrate_n_mg_l,
+        "亚硝态氮": water.nitrite_n_mg_l,
+    }
+    if payload.parameters.model_type == ModelType.asm2d:
+        required_fields.update(
+            {
+                "挥发性脂肪酸": water.vfa_as_cod_mg_l,
+                "正磷酸盐磷": water.orthophosphate_p_mg_l,
+            }
+        )
+    missing = [name for name, value in required_fields.items() if value is None]
+    complete = not missing
+    return {
+        "source": "实测总量约束组分重构" if complete else mapping_method,
+        "engineering_complete": complete,
+        "uncertainty_relative": 0.15 if complete else 0.35,
+        "missing_measurements": missing,
+    }
+
+
 def _kinetic_kwargs(payload: SimulationRequest) -> dict[str, float]:
-    from exposan.bsm1.system import default_asm_kwargs
+    with model_dependency_import_context():
+        from exposan.bsm1.system import default_asm_kwargs
 
     params = payload.parameters
     water = payload.influent
     kind = params.model_type.value.lower()
     values = dict(default_asm_kwargs[kind])
-    heterotroph_ph = _ph_activity(water.ph, 5.0, 6.5, 8.5, 10.0)
-    nitrifier_ph = _ph_activity(water.ph, 5.5, 7.0, 8.0, 9.5)
+    reactor_ph = params.reactor_ph if params.reactor_ph is not None else water.ph
+    heterotroph_ph = _ph_activity(reactor_ph, 5.0, 6.5, 8.5, 10.0)
+    nitrifier_ph = _ph_activity(reactor_ph, 5.5, 7.0, 8.0, 9.5)
     reference_temperature = ASM_REFERENCE_TEMPERATURE_C[params.model_type]
     temperature_factor = 1.072 ** (water.temperature_c - reference_temperature)
     if params.model_type == ModelType.asm1:
@@ -396,7 +488,8 @@ def _kinetic_kwargs(payload: SimulationRequest) -> dict[str, float]:
 
 @contextmanager
 def _temporary_bsm_configuration(payload: SimulationRequest):
-    from exposan.bsm1 import system as bsm
+    with model_dependency_import_context():
+        from exposan.bsm1 import system as bsm
 
     params = payload.parameters
     flow = payload.influent.flow_m3_d
@@ -554,7 +647,9 @@ def _apply_advanced_treatment(
     )
 
 
-def _integration_state_drift(system, simulation_days: float) -> float | None:
+def _integration_state_drift(
+    system, simulation_days: float, comparison_window_days: float = 1.0
+) -> float | None:
     import numpy as np
 
     solution = getattr(getattr(system, "scope", None), "sol", None)
@@ -565,7 +660,10 @@ def _integration_state_drift(system, simulation_days: float) -> float | None:
         or solution.t[-1] < simulation_days - 1e-6
     ):
         return None
-    window_start = max(0.0, simulation_days - min(1.0, simulation_days * 0.1))
+    window_start = max(
+        0.0,
+        simulation_days - min(comparison_window_days, simulation_days * 0.5),
+    )
     start_index = int(np.searchsorted(solution.t, window_start, side="right") - 1)
     start_index = max(0, min(start_index, len(solution.t) - 2))
     elapsed = max(float(solution.t[-1] - solution.t[start_index]), 1e-9)
@@ -580,9 +678,265 @@ def _integration_state_drift(system, simulation_days: float) -> float | None:
     return float(np.percentile(finite_drift, 95) / elapsed)
 
 
-def _integration_converged(system, simulation_days: float) -> bool:
-    drift = _integration_state_drift(system, simulation_days)
+def _integration_converged(
+    system, simulation_days: float, comparison_window_days: float = 1.0
+) -> bool:
+    drift = _integration_state_drift(
+        system, simulation_days, comparison_window_days
+    )
     return drift is not None and drift <= STEADY_STATE_DRIFT_PER_DAY
+
+
+def _influent_profile_rows(payload: SimulationRequest) -> list[dict[str, float]]:
+    rows: list[dict[str, float]] = []
+    for point in payload.influent_series or []:
+        point_payload = payload.model_copy(
+            update={
+                "influent": point.water_quality,
+                "component_concentrations": point.component_concentrations,
+                "influent_series": None,
+            }
+        )
+        concentrations, _ = _bulk_components(point_payload)
+        rows.append(
+            {
+                "t": point.elapsed_days,
+                **concentrations,
+                "Q": point.water_quality.flow_m3_d,
+            }
+        )
+    return rows
+
+
+def _attach_dynamic_influent(system, payload: SimulationRequest):
+    if not payload.influent_series:
+        return system, None, system.flowsheet.stream.wastewater
+
+    with model_dependency_import_context():
+        import pandas as pd
+        from qsdsan import WasteStream, unit_operations as su
+
+    handle, path = tempfile.mkstemp(suffix=".csv", prefix="qinglan-influent-")
+    os.close(handle)
+    try:
+        pd.DataFrame(_influent_profile_rows(payload)).to_csv(path, index=False)
+        original_influent = system.flowsheet.stream.wastewater
+        influent = WasteStream(
+            "dynamic_wastewater",
+            T=original_influent.T,
+            thermo=original_influent.thermo,
+        )
+        generator = su.DynamicInfluent(
+            "DynamicInfluent",
+            outs=[influent],
+            data_file=path,
+            interpolator="slinear",
+        )
+    finally:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+
+    system._delete_path_cache()
+    for unit in system.units:
+        for index, stream in enumerate(unit.ins):
+            if stream is original_influent:
+                unit.ins[index] = influent
+    system._set_path((generator, *system.path))
+    return system, float(generator._t_end), influent
+
+
+def _apply_hot_start(system, payload: SimulationRequest) -> bool:
+    state = payload.hot_start
+    if state is None:
+        return False
+    valid_components = set(system.flowsheet.stream.wastewater.components.IDs)
+    unknown = set(state.reactor_concentrations_mg_l) - valid_components
+    if unknown:
+        raise ValueError("热启动状态包含当前模型未定义的组分：" + "、".join(sorted(unknown)))
+    for unit in system.units:
+        if unit.ID == "C1":
+            if state.clarifier_tss_layers_mg_l is not None:
+                unit.set_init_TSS(state.clarifier_tss_layers_mg_l)
+        elif unit.ID == "AS":
+            unit.set_init_conc(concentrations=state.reactor_concentrations_mg_l)
+        elif hasattr(unit, "set_init_conc") and unit.ID != "DynamicInfluent":
+            unit.set_init_conc(**state.reactor_concentrations_mg_l)
+    return True
+
+
+def _profile_grid(stream, start: float, end: float):
+    import numpy as np
+
+    times = stream.scope.time_series
+    records = stream.scope.record
+    mask = (times >= start - 1e-9) & (times <= end + 1e-9)
+    times = times[mask]
+    records = records[mask]
+    if len(times) < 2:
+        raise ValueError("动态进水末周期没有足够的时序输出点。")
+    unique_times, unique_indices = np.unique(times, return_index=True)
+    records = records[unique_indices]
+    count = max(97, int(math.ceil((end - start) * 24)) + 1)
+    grid = np.linspace(start, end, count)
+    values = np.column_stack(
+        [np.interp(grid, unique_times, records[:, index]) for index in range(records.shape[1])]
+    )
+    return grid, values
+
+
+def _profile_composites(stream, start: float, end: float) -> dict[str, object]:
+    import numpy as np
+
+    times, values = _profile_grid(stream, start, end)
+    concentrations = values[:, :-1]
+    components = stream.components
+    particulate = components.x
+    nongas = 1 - components.g
+    result = {
+        "time": times,
+        "flow": values[:, -1],
+        "cod": concentrations @ components.i_COD,
+        "tn": concentrations @ (components.i_N * nongas),
+        "tss": concentrations @ (components.i_mass * nongas * particulate),
+    }
+    if "S_NH" in components.IDs:
+        result["nh4_n"] = concentrations[:, components.index("S_NH")]
+    else:
+        result["nh4_n"] = concentrations[:, components.index("S_NH4")]
+    result["tp"] = concentrations @ components.i_P
+    return result
+
+
+def _regulatory_profile_value(times, values, instantaneous: bool) -> float:
+    import numpy as np
+
+    if instantaneous:
+        return float(np.max(values))
+    duration = float(times[-1] - times[0])
+    if duration <= 1.0 + 1e-9:
+        return float(np.trapezoid(values, times) / max(duration, 1e-9))
+    window_points = max(2, int(round((len(times) - 1) / duration)) + 1)
+    averages = []
+    for start in range(0, len(times) - window_points + 1):
+        stop = start + window_points
+        elapsed = float(times[stop - 1] - times[start])
+        averages.append(float(np.trapezoid(values[start:stop], times[start:stop]) / elapsed))
+    return max(averages)
+
+
+def _profile_prediction(stream, start: float, end: float, payload: SimulationRequest):
+    data = _profile_composites(stream, start, end)
+    instantaneous = payload.parameters.assessment_basis.value == "instantaneous"
+    value = lambda key: _regulatory_profile_value(
+        data["time"], data[key], instantaneous
+    )
+    return EffluentPrediction(
+        cod_mg_l=round(max(0.0, value("cod")), 3),
+        nh4_n_mg_l=round(max(0.0, value("nh4_n")), 3),
+        tn_mg_l=round(max(0.0, value("tn")), 3),
+        tp_mg_l=round(max(0.0, value("tp")), 3),
+        tss_mg_l=round(max(0.0, value("tss")), 3),
+    )
+
+
+def _profile_average_load(stream, variable: str, start: float, end: float) -> float:
+    import numpy as np
+
+    data = _profile_composites(stream, start, end)
+    key = {"COD": "cod", "N": "tn", "P": "tp"}[variable]
+    loads = data[key] * data["flow"] / 1000
+    return float(np.trapezoid(loads, data["time"]) / (end - start))
+
+
+def _profile_average_flow(stream, start: float, end: float) -> float:
+    import numpy as np
+
+    data = _profile_composites(stream, start, end)
+    return float(np.trapezoid(data["flow"], data["time"]) / (end - start))
+
+
+def _influent_profile_average(
+    payload: SimulationRequest, stream, variable: str | None
+) -> float:
+    import numpy as np
+
+    rows = _influent_profile_rows(payload)
+    times = np.asarray([row["t"] for row in rows], dtype=float)
+    count = max(97, int(math.ceil(times[-1] * 24)) + 1)
+    grid = np.linspace(0, times[-1], count)
+    flow = np.interp(grid, times, [row["Q"] for row in rows])
+    if variable is None:
+        return float(np.trapezoid(flow, grid) / times[-1])
+    component_ids = [key for key in rows[0] if key not in {"t", "Q"}]
+    concentrations = np.column_stack(
+        [np.interp(grid, times, [row[key] for row in rows]) for key in component_ids]
+    )
+    components = stream.components
+    indices = np.asarray([components.index(key) for key in component_ids], dtype=int)
+    if variable == "COD":
+        vector = components.i_COD[indices]
+    elif variable == "N":
+        vector = components.i_N[indices] * (1 - components.g[indices])
+    else:
+        vector = components.i_P[indices]
+    loads = (concentrations @ vector) * flow / 1000
+    return float(np.trapezoid(loads, grid) / times[-1])
+
+
+def _safe_dynamic_reset(system) -> None:
+    system._DAE = None
+    system._state = None
+    for stream in system.streams:
+        if hasattr(stream, "_state"):
+            stream._state = None
+            stream._dstate = None
+    system.dynsim_kwargs = {}
+    system.scope.reset_cache()
+    for unit in system.units:
+        unit.reset_cache(system.isdynamic)
+    for stream in system.streams:
+        stream.reset_cache()
+
+
+def _element_balance_diagnostics(
+    cod_recovery: float,
+    nitrogen_recovery: float,
+    phosphorus_recovery: float | None,
+    inventory_change_relative_per_d: float | None,
+) -> dict[str, float | bool | None]:
+    cod_oxidation_fraction = max(0.0, 1.0 - cod_recovery)
+    nitrogen_gas_fraction = max(0.0, 1.0 - nitrogen_recovery)
+    carbon_error = abs(1.0 - cod_recovery - cod_oxidation_fraction)
+    nitrogen_error = abs(1.0 - nitrogen_recovery - nitrogen_gas_fraction)
+    phosphorus_error = (
+        abs(1.0 - phosphorus_recovery)
+        if phosphorus_recovery is not None
+        else None
+    )
+    inventory_ok = (
+        inventory_change_relative_per_d is not None
+        and inventory_change_relative_per_d <= STEADY_STATE_DRIFT_PER_DAY
+    )
+    element_balance_passed = (
+        carbon_error <= ELEMENT_BALANCE_TOLERANCE
+        and nitrogen_error <= ELEMENT_BALANCE_TOLERANCE
+        and (
+            phosphorus_error is None
+            or phosphorus_error <= ELEMENT_BALANCE_TOLERANCE
+        )
+        and inventory_ok
+    )
+    return {
+        "cod_oxidation_fraction": cod_oxidation_fraction,
+        "nitrogen_gas_fraction": nitrogen_gas_fraction,
+        "carbon_balance_relative_error": carbon_error,
+        "nitrogen_balance_relative_error": nitrogen_error,
+        "phosphorus_balance_relative_error": phosphorus_error,
+        "inventory_change_relative_per_d": inventory_change_relative_per_d,
+        "element_balance_passed": element_balance_passed,
+    }
 
 
 def _oxygen_saturation_mg_l(temperature_c: float) -> float:
@@ -600,15 +954,30 @@ def _oxygen_transfer_diagnostics(
 ) -> dict[str, float | bool]:
     params = payload.parameters
     aerobic_volume = max(config["aerobic_volume"], 1.0)
-    driving_force = max(
-        0.5,
+    pressure_ratio = math.exp(-params.site_altitude_m / 8434.0)
+    corrected_saturation = (
         _oxygen_saturation_mg_l(payload.influent.temperature_c)
-        - params.aerobic_do_mg_l,
+        * params.oxygen_beta_factor
+        * pressure_ratio
+    )
+    driving_force = max(
+        0.1,
+        corrected_saturation - params.aerobic_do_mg_l,
+    )
+    depth_factor = max(
+        0.70, min(1.30, math.sqrt(params.diffuser_submergence_m / 4.0))
+    )
+    field_transfer_factor = (
+        params.oxygen_alpha_factor
+        * params.diffuser_fouling_factor
+        * pressure_ratio
+        * depth_factor
     )
     capacity = (
         params.aeration_power_kw
         * params.aeration_hours_d
         * params.oxygen_transfer_efficiency_kg_o2_kwh
+        * field_transfer_factor
     )
     power_limited_kla = capacity * 1000 / (aerobic_volume * driving_force)
     requested_kla = params.aerobic_kla_d or power_limited_kla
@@ -620,6 +989,11 @@ def _oxygen_transfer_diagnostics(
         "oxygen_transfer_capacity_kg_d": capacity,
         "requested_oxygen_transfer_kg_d": requested_oxygen,
         "oxygen_transfer_sufficient": capacity + 1e-9 >= requested_oxygen * 0.95,
+        "corrected_oxygen_saturation_mg_l": corrected_saturation,
+        "field_transfer_factor": field_transfer_factor,
+        "reactor_ph_used": (
+            params.reactor_ph if params.reactor_ph is not None else payload.influent.ph
+        ),
     }
 
 
@@ -738,7 +1112,13 @@ def run_dynamic_system(
             settler_kwargs=settler,
         )
         _configure_reactor(system, payload, config)
-        influent = system.flowsheet.stream.wastewater
+        system, profile_period_days, influent = _attach_dynamic_influent(
+            system, payload
+        )
+        hot_start_applied = _apply_hot_start(system, payload)
+        effluent = system.flowsheet.stream.effluent
+        was = system.flowsheet.stream.WAS
+        system.set_dynamic_tracker(effluent, was)
         influent.T = water.temperature_c + 273.15
         state_drift_per_d = None
         actual_simulation_days = params.simulation_days
@@ -746,9 +1126,10 @@ def run_dynamic_system(
         for horizon in _simulation_horizons(payload):
             convergence_attempts += 1
             try:
-                final_window_start = max(0.0, horizon - 1.0)
+                comparison_window_days = profile_period_days or 1.0
+                final_window_start = max(0.0, horizon - comparison_window_days)
                 system.simulate(
-                    state_reset_hook="reset_cache",
+                    state_reset_hook=lambda: _safe_dynamic_reset(system),
                     t_span=(0, horizon),
                     t_eval=(final_window_start, horizon),
                     method="LSODA",
@@ -758,7 +1139,9 @@ def run_dynamic_system(
                     "动态积分未能完成，请检查进水负荷、温度、停留时间、回流比和组分数据。"
                 ) from error
             actual_simulation_days = horizon
-            state_drift_per_d = _integration_state_drift(system, horizon)
+            state_drift_per_d = _integration_state_drift(
+                system, horizon, comparison_window_days
+            )
             if (
                 state_drift_per_d is not None
                 and state_drift_per_d <= params.convergence_tolerance_per_d
@@ -773,8 +1156,6 @@ def run_dynamic_system(
             raise ValueError(
                 "动态积分未得到有效解，请检查模型初始条件和进水组分。"
             )
-        effluent = system.flowsheet.stream.effluent
-        was = system.flowsheet.stream.WAS
         ras = system.flowsheet.stream.RAS
 
         cod = float(effluent.COD)
@@ -791,13 +1172,21 @@ def run_dynamic_system(
                 "动态积分产生非有限结果，请检查模型初始条件和进水组分。"
             )
 
-        biological_prediction = EffluentPrediction(
-            cod_mg_l=round(max(0.0, cod), 3),
-            nh4_n_mg_l=round(max(0.0, ammonium), 3),
-            tn_mg_l=round(max(0.0, tn), 3),
-            tp_mg_l=round(max(0.0, tp), 3),
-            tss_mg_l=round(max(0.0, tss), 3),
-        )
+        if profile_period_days is not None:
+            biological_prediction = _profile_prediction(
+                effluent,
+                actual_simulation_days - profile_period_days,
+                actual_simulation_days,
+                payload,
+            )
+        else:
+            biological_prediction = EffluentPrediction(
+                cod_mg_l=round(max(0.0, cod), 3),
+                nh4_n_mg_l=round(max(0.0, ammonium), 3),
+                tn_mg_l=round(max(0.0, tn), 3),
+                tp_mg_l=round(max(0.0, tp), 3),
+                tss_mg_l=round(max(0.0, tss), 3),
+            )
         (
             prediction,
             advanced_energy_kwh_d,
@@ -805,6 +1194,13 @@ def run_dynamic_system(
             advanced_assumptions,
             advanced_warnings,
         ) = _apply_advanced_treatment(biological_prediction, payload)
+        nitrified_n_mg_l = max(
+            0.0,
+            water.nh4_n_mg_l - biological_prediction.nh4_n_mg_l,
+        )
+        alkalinity_margin_mg_l_caco3 = (
+            params.alkalinity_mg_l_caco3 - 7.14 * nitrified_n_mg_l
+        )
 
         reconstructed = {
             "cod_mg_l": round(float(influent.COD), 4),
@@ -835,14 +1231,37 @@ def run_dynamic_system(
             },
             reconstructed=reconstructed,
             relative_residuals=residuals,
+            **_mapping_evidence(payload, mapping_method),
         )
 
-        q_in = influent.F_vol * 24
-        q_eff = effluent.F_vol * 24
-        q_was = was.F_vol * 24
+        profile_start = (
+            actual_simulation_days - profile_period_days
+            if profile_period_days is not None
+            else None
+        )
+        if profile_start is not None:
+            q_in = _influent_profile_average(payload, influent, None)
+            q_eff = _profile_average_flow(
+                effluent, profile_start, actual_simulation_days
+            )
+            q_was = _profile_average_flow(was, profile_start, actual_simulation_days)
+        else:
+            q_in = influent.F_vol * 24
+            q_eff = effluent.F_vol * 24
+            q_was = was.F_vol * 24
         hydraulic_error = abs(q_in - q_eff - q_was) / max(q_in, 1e-9)
 
-        def recovery(variable: str) -> float:
+        def boundary_loads(variable: str) -> tuple[float, float, float]:
+            if profile_start is not None:
+                return (
+                    _influent_profile_average(payload, influent, variable),
+                    _profile_average_load(
+                        effluent, variable, profile_start, actual_simulation_days
+                    ),
+                    _profile_average_load(
+                        was, variable, profile_start, actual_simulation_days
+                    ),
+                )
             if variable == "COD":
                 input_value = float(influent.COD)
                 eff_value = float(effluent.COD)
@@ -851,17 +1270,61 @@ def run_dynamic_system(
                 input_value = float(_safe_composite(influent, variable) or 0.0)
                 eff_value = float(_safe_composite(effluent, variable) or 0.0)
                 was_value = float(_safe_composite(was, variable) or 0.0)
-            load_in = input_value * q_in
-            return (eff_value * q_eff + was_value * q_was) / max(load_in, 1e-9)
+            return (
+                input_value * q_in / 1000,
+                eff_value * q_eff / 1000,
+                was_value * q_was / 1000,
+            )
+
+        def recovery(variable: str) -> float:
+            load_in, load_eff, load_was = boundary_loads(variable)
+            return (load_eff + load_was) / max(load_in, 1e-9)
 
         cod_recovery = recovery("COD")
         nitrogen_recovery = recovery("N")
         phosphorus_recovery = (
             recovery("P") if params.model_type == ModelType.asm2d else None
         )
+        balance_diagnostics = _element_balance_diagnostics(
+            cod_recovery,
+            nitrogen_recovery,
+            phosphorus_recovery,
+            state_drift_per_d,
+        )
+        cod_loads = boundary_loads("COD")
+        nitrogen_loads = boundary_loads("N")
+        phosphorus_loads = (
+            boundary_loads("P")
+            if params.model_type == ModelType.asm2d
+            else None
+        )
+        load_summary = {
+            "cod_influent": cod_loads[0],
+            "cod_effluent": cod_loads[1],
+            "cod_waste_sludge": cod_loads[2],
+            "cod_biologically_oxidized": max(
+                0.0, cod_loads[0] - cod_loads[1] - cod_loads[2]
+            ),
+            "nitrogen_influent": nitrogen_loads[0],
+            "nitrogen_effluent": nitrogen_loads[1],
+            "nitrogen_waste_sludge": nitrogen_loads[2],
+            "nitrogen_to_dinitrogen": max(
+                0.0,
+                nitrogen_loads[0] - nitrogen_loads[1] - nitrogen_loads[2],
+            ),
+        }
+        if phosphorus_loads is not None:
+            load_summary.update(
+                {
+                    "phosphorus_influent": phosphorus_loads[0],
+                    "phosphorus_effluent": phosphorus_loads[1],
+                    "phosphorus_waste_sludge": phosphorus_loads[2],
+                }
+            )
         balance_notes = [
-            "化学需氧量未回收部分为模型计算的生物氧化量。",
-            "总氮未回收部分主要为反硝化生成的氮气。",
+            "化学需氧量边界将出水、排泥和生物氧化去向分别列账。",
+            "总氮边界将出水、排泥和反硝化生成的氮气去向分别列账。",
+            "元素闭合采用双侧3%容差，并要求末端系统库存变化达到准稳态阈值。",
         ]
         if not integration_converged:
             balance_notes.append(
@@ -873,20 +1336,13 @@ def run_dynamic_system(
             abs(value) <= COMPONENT_MAPPING_TOLERANCE
             for value in residuals.values()
         )
-        recovery_ok = (
-            cod_recovery <= MASS_RECOVERY_UPPER_BOUND
-            and nitrogen_recovery <= MASS_RECOVERY_UPPER_BOUND
-            and (
-                phosphorus_recovery is None
-                or phosphorus_recovery <= MASS_RECOVERY_UPPER_BOUND
-            )
-        )
+        recovery_ok = bool(balance_diagnostics["element_balance_passed"])
         balance = MassBalanceResult(
             passed=(
-                hydraulic_error <= 1e-5
+                hydraulic_error <= HYDRAULIC_RELATIVE_ERROR
                 and mapping_ok
                 and integration_converged
-                and recovery_ok
+                and bool(balance_diagnostics["element_balance_passed"])
             ),
             hydraulic_relative_error=round(hydraulic_error, 8),
             cod_recovery=round(cod_recovery, 6),
@@ -901,6 +1357,40 @@ def run_dynamic_system(
                 if state_drift_per_d is not None
                 else None
             ),
+            cod_oxidation_fraction=round(
+                float(balance_diagnostics["cod_oxidation_fraction"]), 6
+            ),
+            nitrogen_gas_fraction=round(
+                float(balance_diagnostics["nitrogen_gas_fraction"]), 6
+            ),
+            carbon_balance_relative_error=round(
+                float(balance_diagnostics["carbon_balance_relative_error"]), 8
+            ),
+            nitrogen_balance_relative_error=round(
+                float(balance_diagnostics["nitrogen_balance_relative_error"]), 8
+            ),
+            phosphorus_balance_relative_error=(
+                round(
+                    float(balance_diagnostics["phosphorus_balance_relative_error"]),
+                    8,
+                )
+                if balance_diagnostics["phosphorus_balance_relative_error"] is not None
+                else None
+            ),
+            inventory_change_relative_per_d=(
+                round(
+                    float(balance_diagnostics["inventory_change_relative_per_d"]),
+                    8,
+                )
+                if balance_diagnostics["inventory_change_relative_per_d"] is not None
+                else None
+            ),
+            element_balance_passed=bool(
+                balance_diagnostics["element_balance_passed"]
+            ),
+            load_summary_kg_d={
+                key: round(value, 6) for key, value in load_summary.items()
+            },
             notes=balance_notes,
         )
         sludge_kg_d = float(was.get_TSS()) * q_was / 1000 + advanced_sludge_kg_d
@@ -911,7 +1401,7 @@ def run_dynamic_system(
             + advanced_energy_kwh_d
         )
         convergence_reached = (
-            hydraulic_error <= 1e-5
+            hydraulic_error <= HYDRAULIC_RELATIVE_ERROR
             and integration_converged
         )
         warnings = []
@@ -925,6 +1415,13 @@ def run_dynamic_system(
             warnings.append(
                 "已启用两点分段进水专用拓扑，进水分别进入两个串联缺氧段。"
             )
+        if profile_period_days is not None:
+            warnings.append(
+                f"已启用{profile_period_days:.3f}天周期动态进水；"
+                "日均判定采用末周期最不利24小时均值，瞬时判定采用末周期峰值。"
+            )
+        if hot_start_applied:
+            warnings.append("已采用经模型类型校验的反应池与二沉池热启动状态。")
         specific_aeration_energy = (
             params.aeration_power_kw * params.aeration_hours_d
             / max(water.flow_m3_d, 1e-9)
@@ -938,6 +1435,16 @@ def run_dynamic_system(
             warnings.append(
                 f"现场传氧系数为{params.aerobic_kla_d:.1f}/天，"
                 f"受当前曝气功率约束后的有效值为{config['effective_kla_d']:.2f}/天。"
+            )
+        if params.reactor_ph is None:
+            warnings.append(
+                "未填写反应池实测酸碱度，动力学暂采用进水酸碱度；"
+                "工程复核应使用同期好氧池实测值。"
+            )
+        if alkalinity_margin_mg_l_caco3 < 50:
+            warnings.append(
+                f"按硝化耗碱量估算的剩余碱度为{alkalinity_margin_mg_l_caco3:.1f}毫克/升，"
+                "存在酸碱度下降和硝化受抑风险。"
             )
         if not config["oxygen_transfer_sufficient"]:
             warnings.append(
@@ -977,7 +1484,7 @@ def run_dynamic_system(
             else:
                 warnings.append("模型尚未达到稳态，表观物质回收暂不参与守恒判定。")
         if not convergence_reached:
-            if hydraulic_error <= 1e-5:
+            if hydraulic_error <= HYDRAULIC_RELATIVE_ERROR:
                 warnings.append(
                     "水力闭合已通过，但末端状态漂移仍超过阈值；"
                     f"当前为{(state_drift_per_d or 0) * 100:.3f}%/天，"
@@ -1027,10 +1534,18 @@ def run_dynamic_system(
                 "oxygen_transfer_capacity_kg_d"
             ],
             "oxygen_transfer_sufficient": config["oxygen_transfer_sufficient"],
+            "corrected_oxygen_saturation_mg_l": config[
+                "corrected_oxygen_saturation_mg_l"
+            ],
+            "reactor_ph_used": config["reactor_ph_used"],
+            "alkalinity_margin_mg_l_caco3": alkalinity_margin_mg_l_caco3,
             "estimated_srt_d": estimated_srt,
             "clarifier_surface_overflow_m_d": clarifier_surface_overflow,
             "predicted_return_sludge_tss_mg_l": predicted_ras_tss,
             "return_sludge_relative_error": return_sludge_relative_error,
+            "dynamic_influent_applied": profile_period_days is not None,
+            "influent_profile_period_days": profile_period_days,
+            "hot_start_applied": hot_start_applied,
         }
         return (
             prediction,

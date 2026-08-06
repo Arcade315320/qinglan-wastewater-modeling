@@ -7,25 +7,32 @@ from app.models.schemas import (
     EffluentPrediction,
     ModelCalibrationRequest,
     ModelType,
+    OperatingDataSource,
     ProcessParameters,
     ProcessType,
     SimulationRequest,
 )
-from app.services.calibration_service import calibrate_model
+from app.services.calibration_service import calibrate_model, _qualification_blockers
 from app.services.model_catalog import list_models
+from app.services.process_capability_service import list_process_capabilities
 from app.services.qsdsan_adapter import (
     _apply_advanced_treatment,
     _bulk_components,
     _configure_reactor,
+    _element_balance_diagnostics,
+    _influent_profile_rows,
     _kinetic_kwargs,
+    _mapping_evidence,
     _ph_activity,
     _oxygen_transfer_diagnostics,
+    _regulatory_profile_value,
     _require_dynamic_memory,
     _simulation_horizons,
     _temporary_bsm_configuration,
     get_engine_status,
 )
 from app.services.simulation_service import run_simulation
+from app.services.traceability_service import build_simulation_manifest
 from app.services.simulation_service import (
     _resolve_limits,
     _run_activated_sludge_screening,
@@ -84,6 +91,17 @@ class QSDsanRegressionTests(unittest.TestCase):
             {ModelType.asm1, ModelType.asm2d, ModelType.masm2d, ModelType.adm1},
         )
 
+    def test_process_capabilities_match_runnable_dynamic_topologies(self) -> None:
+        capabilities = {item.process_type: item for item in list_process_capabilities()}
+        runnable = {key for key, value in capabilities.items() if value.runnable}
+        self.assertEqual(
+            runnable,
+            {ProcessType.cas, ProcessType.ao, ProcessType.aao},
+        )
+        self.assertEqual(capabilities[ProcessType.cas].model_type, ModelType.asm1)
+        self.assertEqual(capabilities[ProcessType.aao].model_type, ModelType.asm2d)
+        self.assertFalse(capabilities[ProcessType.mbr].runnable)
+
     def test_bsm1_fixed_effluent_regression(self) -> None:
         expected = {
             "cod_mg_l": 47.552,
@@ -98,6 +116,18 @@ class QSDsanRegressionTests(unittest.TestCase):
 
     def test_bsm1_mass_balance_and_engine(self) -> None:
         self.assertTrue(self.result.mass_balance.passed)
+        self.assertTrue(self.result.mass_balance.element_balance_passed)
+        self.assertTrue(self.result.mass_balance.load_summary_kg_d)
+
+    def test_element_balance_uses_two_sided_and_inventory_gates(self) -> None:
+        accepted = _element_balance_diagnostics(0.45, 0.48, 1.02, 0.005)
+        self.assertTrue(accepted["element_balance_passed"])
+        low_phosphorus = _element_balance_diagnostics(0.45, 0.48, 0.90, 0.005)
+        self.assertFalse(low_phosphorus["element_balance_passed"])
+        excess_carbon = _element_balance_diagnostics(1.04, 0.48, None, 0.005)
+        self.assertFalse(excess_carbon["element_balance_passed"])
+        drifting = _element_balance_diagnostics(0.45, 0.48, None, 0.02)
+        self.assertFalse(drifting["element_balance_passed"])
         self.assertLess(self.result.mass_balance.hydraulic_relative_error, 1e-6)
         self.assertTrue(self.result.convergence_reached)
         self.assertIn("QSDsan/EXPOsan", self.result.engine)
@@ -223,6 +253,29 @@ class QSDsanRegressionTests(unittest.TestCase):
         self.assertLess(diagnostics["effective_kla_d"], 240)
         self.assertFalse(diagnostics["oxygen_transfer_sufficient"])
 
+    def test_site_and_diffuser_corrections_reduce_field_oxygen_capacity(self) -> None:
+        payload = bsm1_payload()
+        baseline = _oxygen_transfer_diagnostics(payload, {"aerobic_volume": 4000})
+        payload.parameters.site_altitude_m = 2000
+        payload.parameters.diffuser_fouling_factor = 0.6
+        corrected = _oxygen_transfer_diagnostics(payload, {"aerobic_volume": 4000})
+        self.assertLess(
+            corrected["oxygen_transfer_capacity_kg_d"],
+            baseline["oxygen_transfer_capacity_kg_d"],
+        )
+        self.assertLess(
+            corrected["corrected_oxygen_saturation_mg_l"],
+            baseline["corrected_oxygen_saturation_mg_l"],
+        )
+
+    def test_reactor_ph_overrides_influent_ph_for_kinetics(self) -> None:
+        payload = bsm1_payload()
+        payload.influent.ph = 5.2
+        inhibited = _kinetic_kwargs(payload)["mu_A"]
+        payload.parameters.reactor_ph = 7.2
+        corrected = _kinetic_kwargs(payload)["mu_A"]
+        self.assertGreater(corrected, inhibited)
+
     def test_measured_mode_requires_engineering_evidence(self) -> None:
         data = bsm1_payload().model_dump()
         data["parameters"]["operating_data_source"] = "measured"
@@ -336,6 +389,18 @@ class QSDsanRegressionTests(unittest.TestCase):
         payload.parameters.pumping_power_kw = 5
         result = _run_activated_sludge_screening(payload)
         self.assertEqual(result.energy_kwh_d, 1560)
+        self.assertFalse(result.operational_estimate_evidence.energy_calibrated)
+
+        payload.parameters.operating_data_source = OperatingDataSource.measured
+        payload.parameters.measured_total_energy_kwh_d = 1500
+        payload.parameters.measured_dry_sludge_kg_d = result.sludge_kg_d
+        calibrated = _run_activated_sludge_screening(payload)
+        self.assertTrue(calibrated.operational_estimate_evidence.energy_calibrated)
+        self.assertTrue(calibrated.operational_estimate_evidence.sludge_calibrated)
+        self.assertAlmostEqual(
+            calibrated.operational_estimate_evidence.energy_relative_error,
+            0.04,
+        )
 
 class AdvancedTreatmentTests(unittest.TestCase):
     def test_advanced_treatment_meets_target_case_limits(self) -> None:
@@ -413,7 +478,7 @@ class AdvancedTreatmentTests(unittest.TestCase):
 
     def test_conditional_assessment_does_not_authorize_compliance(self) -> None:
         payload = bsm1_payload()
-        payload.parameters.operating_data_source = "measured"
+        payload.parameters.operating_data_source = OperatingDataSource.measured
         payload.parameters.independent_validation_passed = True
         payload.component_concentrations = None
         with patch(
@@ -462,6 +527,9 @@ class AdvancedTreatmentTests(unittest.TestCase):
             "estimated_srt_d": None,
             "clarifier_surface_overflow_m_d": 12.3,
             "return_sludge_relative_error": None,
+            "dynamic_influent_applied": False,
+            "influent_profile_period_days": None,
+            "hot_start_applied": False,
         }
 
     def test_unsupported_process_topology_is_rejected(self) -> None:
@@ -509,6 +577,122 @@ class AdvancedTreatmentTests(unittest.TestCase):
         self.assertEqual(limits.tp_mg_l, 1)
         payload.parameters.assessment_date = datetime(2028, 1, 1).date()
         self.assertEqual(_resolve_limits(payload).tp_mg_l, 0.5)
+
+    def test_instantaneous_limits_follow_amendment_table(self) -> None:
+        payload = bsm1_payload()
+        payload.influent.temperature_c = 10
+        payload.parameters.assessment_basis = "instantaneous"
+        payload.parameters.commissioned_before_2006 = True
+        payload.parameters.assessment_date = datetime(2026, 7, 31).date()
+
+        limits = _resolve_limits(payload)
+        self.assertEqual(limits.cod_mg_l, 75)
+        self.assertEqual(limits.nh4_n_mg_l, 15)
+        self.assertEqual(limits.tn_mg_l, 20)
+        self.assertEqual(limits.tp_mg_l, 1.5)
+        self.assertIn("瞬时值", limits.basis)
+
+        payload.parameters.effluent_standard = "grade_b"
+        grade_b = _resolve_limits(payload)
+        self.assertEqual(grade_b.cod_mg_l, 90)
+        self.assertEqual(grade_b.nh4_n_mg_l, 20)
+        self.assertEqual(grade_b.tn_mg_l, 25)
+        self.assertEqual(grade_b.tp_mg_l, 2.5)
+
+    def test_instantaneous_limits_reject_dates_before_effective_date(self) -> None:
+        payload = bsm1_payload()
+        payload.parameters.assessment_basis = "instantaneous"
+        payload.parameters.assessment_date = datetime(2026, 2, 28).date()
+        with self.assertRaisesRegex(ValueError, "生效后"):
+            _resolve_limits(payload)
+
+    def test_simulation_result_exposes_shared_quality_thresholds(self) -> None:
+        payload = bsm1_payload()
+        payload.parameters.convergence_tolerance_per_d = 0.007
+        result = _run_activated_sludge_screening(payload)
+        self.assertEqual(result.quality_thresholds.component_mapping_relative_error, 0.05)
+        self.assertEqual(result.quality_thresholds.hydraulic_relative_error, 1e-5)
+        self.assertEqual(result.quality_thresholds.element_balance_relative_error, 0.03)
+        self.assertEqual(result.quality_thresholds.state_drift_per_d, 0.007)
+
+    def test_dynamic_influent_requires_cycle_starting_at_zero(self) -> None:
+        payload = bsm1_payload().model_dump(mode="json")
+        first = payload["influent"]
+        payload["influent_series"] = [
+            {"elapsed_days": 0.25, "water_quality": first},
+            {"elapsed_days": 0.5, "water_quality": first},
+            {"elapsed_days": 1.0, "water_quality": first},
+        ]
+        with self.assertRaisesRegex(ValueError, "第0天"):
+            SimulationRequest.model_validate(payload)
+
+    def test_dynamic_influent_is_mapped_to_native_components(self) -> None:
+        payload = bsm1_payload().model_dump(mode="json")
+        first = payload["influent"]
+        peak = {**first, "flow_m3_d": first["flow_m3_d"] * 1.2, "cod_mg_l": 420}
+        payload["influent_series"] = [
+            {"elapsed_days": 0, "water_quality": first},
+            {"elapsed_days": 0.5, "water_quality": peak},
+            {"elapsed_days": 1.0, "water_quality": first},
+        ]
+        request = SimulationRequest.model_validate(payload)
+        rows = _influent_profile_rows(request)
+        self.assertEqual([row["t"] for row in rows], [0, 0.5, 1.0])
+        self.assertEqual(rows[1]["Q"], peak["flow_m3_d"])
+        self.assertIn("S_S", rows[1])
+
+    def test_hot_start_model_must_match_request(self) -> None:
+        payload = bsm1_payload().model_dump(mode="json")
+        payload["hot_start"] = {
+            "model_type": "ASM2d",
+            "reactor_concentrations_mg_l": {"S_F": 5},
+        }
+        with self.assertRaisesRegex(ValueError, "模型类型"):
+            SimulationRequest.model_validate(payload)
+
+    def test_profile_aggregation_distinguishes_daily_and_instantaneous(self) -> None:
+        import numpy as np
+
+        times = np.asarray([0.0, 0.5, 1.0])
+        values = np.asarray([10.0, 30.0, 10.0])
+        self.assertAlmostEqual(
+            _regulatory_profile_value(times, values, False), 20.0
+        )
+        self.assertEqual(_regulatory_profile_value(times, values, True), 30.0)
+
+    def test_supplied_components_reject_unknown_and_incomplete_ids(self) -> None:
+        payload = bsm1_payload()
+        payload.component_concentrations["S_BAD"] = 1
+        with self.assertRaisesRegex(ValueError, "不包含"):
+            _bulk_components(payload)
+
+        payload = bsm1_payload()
+        del payload.component_concentrations["S_ND"]
+        with self.assertRaisesRegex(ValueError, "不完整"):
+            _bulk_components(payload)
+
+    def test_measured_component_source_controls_engineering_evidence(self) -> None:
+        payload = bsm1_payload()
+        assumed = _mapping_evidence(payload, "用户提供的模型组分")
+        self.assertFalse(assumed["engineering_complete"])
+        self.assertEqual(assumed["uncertainty_relative"], 0.35)
+        payload.component_data_source = "measured"
+        measured = _mapping_evidence(payload, "用户提供的模型组分")
+        self.assertTrue(measured["engineering_complete"])
+        self.assertEqual(measured["uncertainty_relative"], 0.05)
+
+    def test_trace_manifest_hashes_are_deterministic_and_input_sensitive(self) -> None:
+        payload = bsm1_payload()
+        first = build_simulation_manifest(payload, "测试标准")
+        second = build_simulation_manifest(payload, "测试标准")
+        self.assertEqual(first.request_sha256, second.request_sha256)
+        self.assertEqual(len(first.request_sha256), 64)
+        changed = payload.model_copy(
+            update={"influent": payload.influent.model_copy(update={"cod_mg_l": 400})}
+        )
+        changed_manifest = build_simulation_manifest(changed, "测试标准")
+        self.assertNotEqual(first.request_sha256, changed_manifest.request_sha256)
+        self.assertNotEqual(first.influent_sha256, changed_manifest.influent_sha256)
 
 class MemoryRequirementTests(unittest.TestCase):
     def test_low_memory_instance_is_rejected_before_model_import(self) -> None:
@@ -574,15 +758,90 @@ class GroupedCalibrationTests(unittest.TestCase):
         with patch(
             "app.services.calibration_service._run_activated_sludge_screening",
             side_effect=self._fake_simulation,
+        ), patch(
+            "app.services.calibration_service._run_calibration_simulation",
+            side_effect=self._fake_simulation,
         ):
             result = calibrate_model(request)
         self.assertEqual(result.training_sample_count, 6)
         self.assertEqual(result.validation_sample_count, 4)
+        self.assertGreaterEqual(result.iterations, 1)
+        self.assertLessEqual(result.iterations, request.max_iterations)
+        self.assertEqual(result.method, "完整QSDsan动态迭代校准")
         self.assertIsNotNone(result.validation_objective)
         self.assertGreater(result.improvement_percent, 50)
         self.assertTrue(result.validation_passed)
         self.assertTrue(result.calibration_passed)
         self.assertTrue(all(value <= 0.2 for value in result.validation_indicator_nrmse.values()))
+        self.assertIsNotNone(result.dataset_hash)
+        self.assertGreater(result.validation_period_start, result.training_period_end)
+        self.assertEqual(len(result.validation_sample_hashes), 4)
+        self.assertFalse(result.engineering_qualified)
+        self.assertTrue(result.qualification_blockers)
+
+        measured_samples = []
+        for sample in request.samples:
+            measured_samples.append(
+                sample.model_copy(
+                    update={
+                        "influent": sample.influent.model_copy(
+                            update={
+                                "soluble_cod_mg_l": 100,
+                                "nitrate_n_mg_l": 2,
+                                "nitrite_n_mg_l": 0.2,
+                                "vfa_as_cod_mg_l": 40,
+                                "orthophosphate_p_mg_l": 2,
+                            }
+                        ),
+                        "parameters": sample.parameters.model_copy(
+                            update={
+                                "operating_data_source": "measured",
+                                "reactor_volume_m3": 5000,
+                                "waste_sludge_flow_m3_d": 50,
+                                "mixed_liquor_tss_mg_l": 3000,
+                                "waste_sludge_tss_mg_l": 8000,
+                                "clarifier_surface_area_m2": 500,
+                                "clarifier_depth_m": 4,
+                                "settler_v_max_m_d": 474,
+                                "settler_v_max_practical_m_d": 250,
+                                "settler_tss_threshold_mg_l": 3000,
+                                "aerobic_kla_d": 120,
+                                "reactor_ph": 7.2,
+                            }
+                        ),
+                    }
+                )
+            )
+        qualified_payload = request.model_copy(update={"samples": measured_samples})
+        self.assertEqual(_qualification_blockers(qualified_payload), [])
+
+    def test_calibration_rejects_same_plant_same_day_duplicates(self) -> None:
+        sample = {
+            "group_id": "同日重复厂",
+            "sample_time": datetime(2026, 1, 1, 8),
+            "influent": {
+                "flow_m3_d": 10000,
+                "cod_mg_l": 300,
+                "nh4_n_mg_l": 30,
+                "tn_mg_l": 45,
+                "tp_mg_l": 5,
+                "tss_mg_l": 200,
+                "ph": 7.2,
+                "temperature_c": 20,
+            },
+            "measured": {"cod_mg_l": 150},
+        }
+        later_same_day = {
+            **sample,
+            "sample_time": datetime(2026, 1, 1, 16),
+        }
+        with self.assertRaisesRegex(ValueError, "同厂同日只能保留一条"):
+            calibrate_model(
+                ModelCalibrationRequest(
+                    project_id="duplicate-day",
+                    samples=[sample, later_same_day],
+                )
+            )
 
     def test_validation_rejects_one_indicator_over_twenty_percent(self) -> None:
         start = datetime(2026, 1, 1)
@@ -618,6 +877,9 @@ class GroupedCalibrationTests(unittest.TestCase):
         )
         with patch(
             "app.services.calibration_service._run_activated_sludge_screening",
+            side_effect=self._fake_simulation,
+        ), patch(
+            "app.services.calibration_service._run_calibration_simulation",
             side_effect=self._fake_simulation,
         ):
             result = calibrate_model(request)
@@ -664,6 +926,9 @@ class GroupedCalibrationTests(unittest.TestCase):
         )
         with patch(
             "app.services.calibration_service._run_activated_sludge_screening",
+            side_effect=worsening_simulation,
+        ), patch(
+            "app.services.calibration_service._run_calibration_simulation",
             side_effect=worsening_simulation,
         ):
             result = calibrate_model(request)

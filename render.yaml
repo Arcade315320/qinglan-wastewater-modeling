@@ -14,3 +14,16 @@ services:
         sync: false
       - key: SIMULATION_TIMEOUT_SECONDS
         value: "880"
+      - key: DATABASE_URL
+        fromDatabase:
+          name: qinglan-wastewater-db
+          property: connectionString
+
+databases:
+  - name: qinglan-wastewater-db
+    plan: basic-256mb
+    region: singapore
+    databaseName: qinglan_wastewater
+    user: qinglan_app
+    postgresMajorVersion: "18"
+    ipAllowList: []

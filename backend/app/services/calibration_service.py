@@ -1,4 +1,6 @@
 from collections import Counter, defaultdict
+from hashlib import sha256
+import json
 from math import sqrt
 from statistics import median
 
@@ -11,8 +13,11 @@ from app.models.schemas import (
     ModelCalibrationResult,
     ProcessParameters,
     SimulationRequest,
+    ModelType,
+    OperatingDataSource,
 )
 from app.services.simulation_service import _run_activated_sludge_screening
+from app.services.simulation_gateway import run_simulation_dispatch
 
 
 FACTOR_FIELDS = {
@@ -29,6 +34,63 @@ INDICATOR_SCALES = {
     "tp_mg_l": 0.2,
     "tss_mg_l": 2.0,
 }
+
+
+def _sample_hash(sample) -> str:
+    payload = sample.model_dump(mode="json")
+    serialized = json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return sha256(serialized.encode("utf-8")).hexdigest()
+
+
+def _dataset_hash(samples) -> str:
+    hashes = sorted(_sample_hash(sample) for sample in samples)
+    return sha256("|".join(hashes).encode("ascii")).hexdigest()
+
+
+def _qualification_blockers(payload: ModelCalibrationRequest) -> list[str]:
+    blockers = []
+    for sample in payload.samples:
+        params = sample.parameters
+        water = sample.influent
+        if params.operating_data_source != OperatingDataSource.measured:
+            blockers.append("校准与验证样本的运行参数来源必须为同期现场实测")
+        required_operations = (
+            params.reactor_volume_m3,
+            params.waste_sludge_flow_m3_d,
+            params.mixed_liquor_tss_mg_l,
+            params.waste_sludge_tss_mg_l,
+            params.aerobic_kla_d,
+            params.reactor_ph,
+        )
+        if any(value is None for value in required_operations):
+            blockers.append("缺少同期实测池容、排泥、污泥、传氧系数或反应池酸碱度")
+        required_settler = (
+            params.clarifier_surface_area_m2,
+            params.clarifier_depth_m,
+            params.settler_v_max_m_d,
+            params.settler_v_max_practical_m_d,
+            params.settler_tss_threshold_mg_l,
+        )
+        if any(value is None for value in required_settler):
+            blockers.append("缺少二沉池面积、深度和沉降参数")
+        fractionation = (
+            water.soluble_cod_mg_l,
+            water.nitrate_n_mg_l,
+            water.nitrite_n_mg_l,
+        )
+        if params.model_type == ModelType.asm2d:
+            fractionation += (
+                water.vfa_as_cod_mg_l,
+                water.orthophosphate_p_mg_l,
+            )
+        if any(value is None for value in fractionation):
+            blockers.append("缺少与模型匹配的实测进水组分")
+    return list(dict.fromkeys(blockers))
 
 
 def calculate_error_metrics(payload: CalibrationRequest) -> CalibrationResult:
@@ -69,13 +131,20 @@ def _apply_factors(
     return parameters.model_copy(update=updates)
 
 
+def _run_calibration_simulation(request: SimulationRequest):
+    return run_simulation_dispatch(request)
+
+
 def _predictions(
-    payload: ModelCalibrationRequest, factors: dict[str, float]
+    payload: ModelCalibrationRequest,
+    factors: dict[str, float],
+    runner=None,
 ) -> list[tuple[dict[str, float], dict[str, float | None]]]:
+    runner = runner or _run_calibration_simulation
     rows = []
     for sample in payload.samples:
         parameters = _apply_factors(sample.parameters, factors)
-        result = _run_activated_sludge_screening(
+        result = runner(
             SimulationRequest(
                 project_id=payload.project_id,
                 influent=sample.influent,
@@ -220,7 +289,20 @@ def calibrate_model(payload: ModelCalibrationRequest) -> ModelCalibrationResult:
     if len(configurations) != 1:
         raise ValueError("一次校准只能包含同一种工艺和同一个模型版本。")
     grouped = defaultdict(list)
+    seen_group_days = set()
+    seen_sample_hashes = set()
     for sample in payload.samples:
+        group_day = (sample.group_id, sample.sample_time.date())
+        if group_day in seen_group_days:
+            raise ValueError(
+                f"污水厂“{sample.group_id}”在{sample.sample_time.date().isoformat()}存在重复样本；"
+                "同厂同日只能保留一条经质量控制的记录。"
+            )
+        seen_group_days.add(group_day)
+        sample_hash = _sample_hash(sample)
+        if sample_hash in seen_sample_hashes:
+            raise ValueError("校准数据包含内容和时间完全相同的重复记录。")
+        seen_sample_hashes.add(sample_hash)
         grouped[sample.group_id].append(sample)
     training_samples = []
     validation_samples = []
@@ -235,8 +317,15 @@ def calibrate_model(payload: ModelCalibrationRequest) -> ModelCalibrationResult:
             else 0
         )
         if validation_count:
-            training_samples.extend(ordered[:-validation_count])
-            validation_samples.extend(ordered[-validation_count:])
+            group_training = ordered[:-validation_count]
+            group_validation = ordered[-validation_count:]
+            if (
+                group_validation[0].sample_time.date()
+                <= group_training[-1].sample_time.date()
+            ):
+                raise ValueError("独立验证日期必须严格晚于训练数据的最后日期。")
+            training_samples.extend(group_training)
+            validation_samples.extend(group_validation)
         else:
             training_samples.extend(ordered)
     if len(training_samples) < 2:
@@ -244,19 +333,49 @@ def calibrate_model(payload: ModelCalibrationRequest) -> ModelCalibrationResult:
     training_payload = payload.model_copy(
         update={"samples": training_samples, "validation_fraction": 0}
     )
-    initial_rows = _predictions(
-        training_payload, {name: 1.0 for name in FACTOR_FIELDS}
+    unit_factors = {name: 1.0 for name in FACTOR_FIELDS}
+    screening_rows = _predictions(
+        training_payload,
+        unit_factors,
+        runner=_run_activated_sludge_screening,
     )
+    prefit_factors = _estimate_factors(screening_rows)
+    initial_rows = _predictions(training_payload, unit_factors)
     initial_objective = _objective_from_rows(initial_rows)
-    factors = _estimate_factors(initial_rows)
-    calibrated_rows = _predictions(training_payload, factors)
-    best_objective = _objective_from_rows(calibrated_rows)
-    iterations = 1
-    candidate_rejected = best_objective >= initial_objective
-    if candidate_rejected:
-        factors = {name: 1.0 for name in FACTOR_FIELDS}
-        calibrated_rows = initial_rows
-        best_objective = initial_objective
+    factors = unit_factors
+    calibrated_rows = initial_rows
+    best_objective = initial_objective
+    iterations = 0
+    candidate_rejected = False
+    candidate = prefit_factors
+    while iterations < payload.max_iterations:
+        candidate_rows = _predictions(training_payload, candidate)
+        candidate_objective = _objective_from_rows(candidate_rows)
+        iterations += 1
+        improvement_ratio = (
+            (best_objective - candidate_objective) / best_objective
+            if best_objective
+            else 0.0
+        )
+        if candidate_objective < best_objective:
+            factors = candidate
+            calibrated_rows = candidate_rows
+            best_objective = candidate_objective
+        elif iterations == 1:
+            candidate_rejected = True
+        if abs(improvement_ratio) < 0.001 and iterations > 1:
+            break
+        adjustments = _estimate_factors(calibrated_rows)
+        next_candidate = {
+            name: round(
+                max(0.1, min(5.0, factors[name] * adjustments[name] ** 0.5)),
+                6,
+            )
+            for name in FACTOR_FIELDS
+        }
+        if next_candidate == candidate or next_candidate == factors:
+            break
+        candidate = next_candidate
     improvement = (
         (initial_objective - best_objective) / initial_objective * 100
         if initial_objective
@@ -264,8 +383,8 @@ def calibrate_model(payload: ModelCalibrationRequest) -> ModelCalibrationResult:
     )
     warnings = []
     warnings.append(
-        "本次拟合使用降阶模型进行预校准；拟合因子必须重新代入完整动态系统，"
-        "并通过独立日期实测数据验证后方可采用。"
+        "降阶模型仅用于生成初始候选因子；训练目标、候选筛选和独立验证均使用"
+        "完整QSDsan动态系统。"
     )
     inhibited_ph_count = sum(
         sample.influent.ph < 5.5 or sample.influent.ph > 9.5
@@ -352,6 +471,14 @@ def calibrate_model(payload: ModelCalibrationRequest) -> ModelCalibrationResult:
             "未建立独立验证时段；每座污水厂至少需要五条连续日期样本，"
             "且全部分组合计至少保留两条不参与拟合。"
         )
+    qualification_blockers = _qualification_blockers(payload)
+    engineering_qualified = validation_passed and not qualification_blockers
+    if validation_passed and qualification_blockers:
+        warnings.append(
+            "数值验证已通过，但现场证据不完整，暂不授予工程复核资格："
+            + "、".join(qualification_blockers)
+            + "。"
+        )
     return ModelCalibrationResult(
         project_id=payload.project_id,
         sample_count=len(payload.samples),
@@ -371,9 +498,27 @@ def calibrate_model(payload: ModelCalibrationRequest) -> ModelCalibrationResult:
         validation_passed=validation_passed,
         calibration_passed=calibration_passed,
         validation_indicator_nrmse=validation_indicator_nrmse,
-        method="降阶模型预校准",
+        dataset_hash=_dataset_hash(payload.samples),
+        training_period_start=min(item.sample_time for item in training_samples),
+        training_period_end=max(item.sample_time for item in training_samples),
+        validation_period_start=(
+            min(item.sample_time for item in validation_samples)
+            if validation_samples
+            else None
+        ),
+        validation_period_end=(
+            max(item.sample_time for item in validation_samples)
+            if validation_samples
+            else None
+        ),
+        validation_sample_hashes=[
+            _sample_hash(item) for item in validation_samples
+        ],
+        engineering_qualified=engineering_qualified,
+        qualification_blockers=qualification_blockers,
+        method="完整QSDsan动态迭代校准",
         recommendation=(
-            "将候选因子代入完整QSDsan动态系统，并在未参与拟合的独立日期范围内复核。"
+            "仅在未参与拟合的后续独立日期范围内复核通过后采用本次参数。"
         ),
         warnings=warnings,
     )

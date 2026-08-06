@@ -23,6 +23,8 @@ INDICATOR_LABELS = {
 
 
 def _compliance_label(simulation: SimulationResult, passed: bool) -> str:
+    if not simulation.compliance_valid:
+        return "待判定（模型证据不足）"
     if not passed:
         return "超标"
     verified = simulation.reliability.checks.get("强化处理现场核实", True)
@@ -127,6 +129,7 @@ def _create_pdf(
             f"排放判定：{simulation.limits.source}，{simulation.limits.basis}<br/>"
             f"适用指标：{'化学需氧量、氨氮、总氮、悬浮物' if not simulation.applicable_indicators.get('tp', True) else '化学需氧量、氨氮、总氮、总磷、悬浮物'}<br/>"
             f"可信度等级：{simulation.reliability.level}（{simulation.reliability.score}分）<br/>"
+            f"正式判定状态：{'可判定' if simulation.compliance_valid else '待判定（模型证据不足）'}<br/>"
             f"计算时间：{simulation.created_at:%Y-%m-%d %H:%M}",
             body_style,
         ),
@@ -178,9 +181,17 @@ def _create_pdf(
                 f"水力相对误差：{simulation.mass_balance.hydraulic_relative_error:.3e}<br/>"
                 f"化学需氧量回收比例：{simulation.mass_balance.cod_recovery:.3f}<br/>"
                 f"总氮回收比例：{simulation.mass_balance.nitrogen_recovery:.3f}<br/>"
+                f"元素与库存闭合：{'通过' if simulation.mass_balance.element_balance_passed else '未通过'}<br/>"
                 f"实际动态积分时长：{simulation.simulation_days:.0f}天（{simulation.convergence_attempts}轮）<br/>"
                 f"有效传氧系数：{simulation.effective_kla_d or 0:.3f}/天<br/>"
                 f"供氧能力：{simulation.oxygen_transfer_capacity_kg_d or 0:.3f}千克氧/天<br/>"
+                f"修正饱和溶解氧：{simulation.corrected_oxygen_saturation_mg_l or 0:.3f}毫克/升<br/>"
+                f"反应池酸碱度：{simulation.reactor_ph_used or 0:.2f}<br/>"
+                f"硝化后剩余碱度：{simulation.alkalinity_margin_mg_l_caco3 or 0:.2f}毫克/升<br/>"
+                f"估算运行能耗：{simulation.energy_kwh_d:.2f}千瓦时/日；"
+                f"实测校准：{'通过' if simulation.operational_estimate_evidence.energy_calibrated else '未通过'}<br/>"
+                f"估算干污泥产量：{simulation.sludge_kg_d:.2f}千克/日；"
+                f"实测校准：{'通过' if simulation.operational_estimate_evidence.sludge_calibrated else '未通过'}<br/>"
                 f"质量守恒检查：{'通过' if simulation.mass_balance.passed else '未通过'}<br/>"
                 f"末端准稳态判定：{'达到' if simulation.convergence_reached else '尚未达到'}",
                 body_style,
@@ -189,6 +200,18 @@ def _create_pdf(
             Paragraph(
                 f"结论：{simulation.reliability.decision}<br/>"
                 f"尚缺证据：{'、'.join(simulation.reliability.blockers) or '无'}",
+                body_style,
+            ),
+            Paragraph("五、计算追溯清单", heading_style),
+            Paragraph(
+                f"完整请求哈希：{simulation.manifest.request_sha256}<br/>"
+                f"参数哈希：{simulation.manifest.parameters_sha256}<br/>"
+                f"进水哈希：{simulation.manifest.influent_sha256}<br/>"
+                f"代码提交：{simulation.manifest.code_revision}<br/>"
+                f"程序版本：{simulation.manifest.application_version}<br/>"
+                f"QSDsan/EXPOsan：{simulation.manifest.qsdsan_version}/"
+                f"{simulation.manifest.exposan_version}<br/>"
+                f"独立验证记录：{simulation.manifest.validation_record_id or '无'}",
                 body_style,
             ),
             Paragraph("五、假设与提示", heading_style),
@@ -231,18 +254,43 @@ def _create_excel(
             f"{simulation.reliability.level}（{simulation.reliability.score}分）",
         ),
         (
+            "正式判定状态",
+            "可判定" if simulation.compliance_valid else "待判定（模型证据不足）",
+        ),
+        (
             "结果范围",
             "生化段加强化处理最终出水"
             if simulation.advanced_treatment_applied
             else "基础生化段与二沉池出水",
         ),
         ("仿真编号", simulation.simulation_id),
+        ("完整请求哈希", simulation.manifest.request_sha256),
+        ("进水哈希", simulation.manifest.influent_sha256),
+        ("参数哈希", simulation.manifest.parameters_sha256),
+        ("组分数据哈希", simulation.manifest.component_data_sha256),
+        ("代码提交", simulation.manifest.code_revision),
+        ("程序版本", simulation.manifest.application_version),
+        ("QSDsan版本", simulation.manifest.qsdsan_version),
+        ("EXPOsan版本", simulation.manifest.exposan_version),
+        ("Python版本", simulation.manifest.python_version),
+        ("独立验证记录", simulation.manifest.validation_record_id),
         ("计算时间", simulation.created_at.strftime("%Y-%m-%d %H:%M:%S")),
         ("实际动态积分时长（天）", simulation.simulation_days),
         ("自动收敛检查轮数", simulation.convergence_attempts),
         ("有效传氧系数（每天）", simulation.effective_kla_d),
         ("供氧能力（千克氧/天）", simulation.oxygen_transfer_capacity_kg_d),
+        ("修正饱和溶解氧（毫克/升）", simulation.corrected_oxygen_saturation_mg_l),
+        ("反应池酸碱度", simulation.reactor_ph_used),
+        ("硝化后剩余碱度（毫克/升）", simulation.alkalinity_margin_mg_l_caco3),
         ("估算污泥龄（天）", simulation.estimated_srt_d),
+        ("估算运行能耗（千瓦时/日）", simulation.energy_kwh_d),
+        ("能耗证据口径", simulation.operational_estimate_evidence.energy_basis),
+        ("能耗实测校准", "通过" if simulation.operational_estimate_evidence.energy_calibrated else "未通过"),
+        ("能耗相对误差", simulation.operational_estimate_evidence.energy_relative_error),
+        ("估算干污泥产量（千克/日）", simulation.sludge_kg_d),
+        ("污泥证据口径", simulation.operational_estimate_evidence.sludge_basis),
+        ("污泥实测校准", "通过" if simulation.operational_estimate_evidence.sludge_calibrated else "未通过"),
+        ("污泥相对误差", simulation.operational_estimate_evidence.sludge_relative_error),
         ("二沉池表面水力负荷（米/天）", simulation.clarifier_surface_overflow_m_d),
         (),
         ("指标", "生化段出水", "最终出水", "限值", "去除率", "达标情况"),
@@ -284,6 +332,11 @@ def _create_excel(
         cell.fill = PatternFill("solid", fgColor="DCEFE8")
 
     mapping = workbook.create_sheet("组分映射与守恒")
+    mapping.append(("组分数据来源", simulation.component_mapping.source))
+    mapping.append(("工程完整性", "是" if simulation.component_mapping.engineering_complete else "否"))
+    mapping.append(("相对不确定度", simulation.component_mapping.uncertainty_relative))
+    mapping.append(("缺失实测项", "、".join(simulation.component_mapping.missing_measurements)))
+    mapping.append(())
     mapping.append(("模型组分", "浓度（毫克/升）"))
     for key, value in simulation.component_mapping.concentrations_mg_l.items():
         mapping.append((key, value))
@@ -294,6 +347,11 @@ def _create_excel(
     mapping.append(("总氮回收比例", simulation.mass_balance.nitrogen_recovery))
     if simulation.applicable_indicators.get("tp", True):
         mapping.append(("总磷回收比例", simulation.mass_balance.phosphorus_recovery))
+    mapping.append(("元素与库存闭合", "是" if simulation.mass_balance.element_balance_passed else "否"))
+    mapping.append(("碳边界相对误差", simulation.mass_balance.carbon_balance_relative_error))
+    mapping.append(("氮边界相对误差", simulation.mass_balance.nitrogen_balance_relative_error))
+    if simulation.applicable_indicators.get("tp", True):
+        mapping.append(("磷边界相对误差", simulation.mass_balance.phosphorus_balance_relative_error))
     mapping.append(("质量守恒是否通过", "是" if simulation.mass_balance.passed else "否"))
     mapping.append(("可信度等级", simulation.reliability.level))
     mapping.append(("可信度分数", simulation.reliability.score))
